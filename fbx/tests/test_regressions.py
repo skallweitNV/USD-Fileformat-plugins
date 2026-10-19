@@ -84,3 +84,12 @@ def test_distinct_images_with_same_basename(tmp_path: Path) -> None:
     assert (
         len(images) == 2
     ), "Distinct source images must not merge in the material image cache"
+
+
+def test_large_nonuniform_scale() -> None:
+    stage = open_fbx(DATA / "empty_texture.fbx")
+    mesh = next(UsdGeom.Mesh(p) for p in stage.Traverse() if p.IsA(UsdGeom.Mesh))
+    matrix = np.array(mesh.ComputeLocalToWorldTransform(Usd.TimeCode.Default()))
+    np.testing.assert_allclose(
+        matrix, np.diag([100000, 3.5355439387, 4, 1]), rtol=1e-6, atol=1e-7
+    )

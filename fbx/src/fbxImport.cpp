@@ -208,9 +208,26 @@ importFbxTransform(ImportFbxContext& ctx,
                                       const FbxAMatrix& localTransform) {
         GfVec3h scaleH;
         GfMatrix4d usdLocalTransform = ConvertMatrix4<FbxAMatrix, GfMatrix4d>(localTransform);
-        UsdSkelDecomposeTransform(usdLocalTransform, &translation, &rotation, &scaleH);
+        // Node scales are Float3, unlike skeletal animation's Half3 scales.
+        // Factoring directly avoids half precision overflow for large geometry
+        // (e.g. an ocean floor) and accumulated error in nested hierarchies.
+        GfMatrix4d scaleOrientation, rotationMatrix, perspective;
+        GfVec3d factoredScale, factoredTranslation;
+        if (usdLocalTransform.Factor(&scaleOrientation,
+                                     &factoredScale,
+                                     &rotationMatrix,
+                                     &factoredTranslation,
+                                     &perspective) &&
+            rotationMatrix.Orthonormalize()) {
+            translation = GfVec3f(factoredTranslation);
+            rotation = GfQuatf(rotationMatrix.ExtractRotationQuat());
+            scale = GfVec3f(factoredScale);
+        } else {
+            // Preserve the existing singular-transform fallback below.
+            UsdSkelDecomposeTransform(usdLocalTransform, &translation, &rotation, &scaleH);
+            scale = scaleH;
+        }
         rotation.Normalize();
-        scale = scaleH;
     };
 
     // Only import regular node animations if this is not an animated skeleton node
