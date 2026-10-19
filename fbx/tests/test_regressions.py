@@ -43,3 +43,44 @@ def test_empty_texture_slot() -> None:
     )
     normal = material.ComputeSurfaceSource()[0].GetInput("normal")
     assert not normal or not normal.HasConnectedSource()
+
+
+def write_png(path: Path, color: tuple[int, int, int]) -> None:
+    # A single RGB pixel; generate fixtures without an imaging dependency.
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload))
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(bytes((0, *color))))
+        + chunk(b"IEND", b"")
+    )
+
+
+def test_distinct_images_with_same_basename(tmp_path: Path) -> None:
+    source = tmp_path / "duplicates.fbx"
+    shutil.copyfile(DATA / "duplicate_texture_names.fbx", source)
+    for directory, color in zip(("a", "b"), ((255, 0, 0), (0, 255, 0))):
+        write_png(tmp_path / directory / "shared.png", color)
+    stage = open_fbx(source)
+    images = set()
+    for prim in stage.Traverse():
+        for attribute in prim.GetAttributes():
+            value = attribute.Get()
+            if isinstance(value, Sdf.AssetPath) and value.path:
+                resolved = value.resolvedPath or str(
+                    Ar.GetResolver().Resolve(value.path)
+                )
+                asset = Ar.GetResolver().OpenAsset(Ar.ResolvedPath(resolved))
+                assert asset, value.path
+                images.add(bytes(asset.GetBuffer()))
+    assert (
+        len(images) == 2
+    ), "Distinct source images must not merge in the material image cache"

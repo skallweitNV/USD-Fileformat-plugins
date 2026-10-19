@@ -2482,6 +2482,8 @@ void
 importFbxMaterials(ImportFbxContext& ctx)
 {
     std::unordered_map<FbxObject*, size_t> textures;
+    std::unordered_map<std::string, std::string> imageUris;
+    std::unordered_set<std::string> usedImageUris;
     std::vector<ImageAsset> images(ctx.scene->GetTextureCount());
     const std::filesystem::path parentPath =
       std::filesystem::u8path(ctx.fbx->filename).parent_path();
@@ -2568,7 +2570,20 @@ importFbxMaterials(ImportFbxContext& ctx)
         const std::string extension = TfGetExtension(name);
         ImageAsset& image = images[i];
         image.name = name;
-        image.uri = name;
+        // InputTranslator caches direct images by basename. Distinct source
+        // files with the same name must have distinct URIs before translation.
+        const std::string sourceKey = isEmbedded ? origAbsFileName : absFileName;
+        auto uri = imageUris.find(sourceKey);
+        if (uri == imageUris.end()) {
+            std::string candidate = name;
+            size_t suffix = 1;
+            while (!usedImageUris.insert(TfStringToLower(candidate)).second) {
+                candidate = TfStringGetBeforeSuffix(name) + "_" + std::to_string(suffix++) +
+                            (extension.empty() ? "" : "." + extension);
+            }
+            uri = imageUris.emplace(sourceKey, candidate).first;
+        }
+        image.uri = uri->second;
         image.format = getFormat(extension);
         if (ctx.options->importImages) {
             if (isEmbedded) {
