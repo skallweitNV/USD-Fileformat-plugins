@@ -110,3 +110,11 @@ def test_normalized_double_orientations() -> None:
             value = attribute.Get(time)
             if value is not None:
                 assert abs(value.GetLength() - 1) < 1e-14
+
+
+def test_source_frame_timing() -> None:
+    stage = open_fbx(DATA / "cubic_camera_pivot.fbx")
+    assert stage.GetTimeCodesPerSecond() == 24
+    assert stage.GetFramesPerSecond() == 24
+    assert stage.GetStartTimeCode() == 0
+    assert stage.GetEndTimeCode() == 48

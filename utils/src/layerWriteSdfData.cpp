@@ -100,6 +100,8 @@ _writeMetadata(SdfAbstractData* sdfData,
           sdfData, SdfFieldKeys->EndTimeCode, VtValue((double)usdData.animationTracks[0].maxTime));
         setLayerMetadata(
           sdfData, SdfFieldKeys->TimeCodesPerSecond, VtValue(usdData.timeCodesPerSecond));
+        setLayerMetadata(
+          sdfData, SdfFieldKeys->FramesPerSecond, VtValue(usdData.timeCodesPerSecond));
     }
     if (!renderSettingsPrimPath.IsEmpty()) {
         setLayerMetadata(sdfData,
@@ -1367,8 +1369,8 @@ _writeAnimationTracks(const WriteLayerOptions& options, UsdData& data)
             track.offsetToJoinedTimeline = 0.0f;
         } else {
             const AnimationTrack& prevTrack = data.animationTracks[prevTrackIndex];
-            track.offsetToJoinedTimeline =
-              prevTrack.maxTime + prevTrack.offsetToJoinedTimeline - track.minTime + 1.0f;
+            track.offsetToJoinedTimeline = prevTrack.maxTime + prevTrack.offsetToJoinedTimeline -
+                                           track.minTime + data.timeCodesPerSecond;
         }
 
         prevTrackIndex = trackIndex;

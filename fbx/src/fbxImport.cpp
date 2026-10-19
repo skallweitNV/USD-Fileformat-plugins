@@ -4003,6 +4003,35 @@ importFbx(const ImportFbxOptions& options, Fbx& fbx, UsdData& usd)
         importFbxNodeHierarchy(ctx);
         markAnimatedSkeletonNodes(ctx);
         setSkeletonParents(ctx);
+
+        // Keep internal evaluation in seconds, then author source-frame time
+        // codes. Consumers such as Blender treat USD sample times as frames;
+        // matching timeCodesPerSecond and framesPerSecond preserves duration.
+        double fps = FbxTime::GetFrameRate(ctx.scene->GetGlobalSettings().GetTimeMode());
+        if (fps <= 0)
+            fps = ctx.scene->GetGlobalSettings().GetCustomFrameRate();
+        if (fps <= 0)
+            fps = 24;
+        for (auto& track : usd.animationTracks) {
+            track.minTime *= fps;
+            track.maxTime *= fps;
+        }
+        auto toFrames = [fps](auto& times) {
+            for (auto& time : times)
+                time *= fps;
+        };
+        for (auto& node : usd.nodes) {
+            for (auto& animation : node.animations) {
+                toFrames(animation.translations.times);
+                toFrames(animation.rotations.times);
+                toFrames(animation.scales.times);
+            }
+        }
+        for (auto& skeleton : usd.skeletons) {
+            for (auto& animation : skeleton.skeletonAnimations)
+                toFrames(animation.times);
+        }
+        usd.timeCodesPerSecond = fps;
     }
 
     return true;
