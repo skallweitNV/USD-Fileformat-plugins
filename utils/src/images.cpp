@@ -12,15 +12,18 @@ governing permissions and limitations under the License.
 #include <OpenImageIO/filesystem.h>
 #include <OpenImageIO/imagebufalgo.h>
 #include <OpenImageIO/imageio.h>
+#include <algorithm>
 #include <cstdint>
 #include <fileformatutils/common.h>
 #include <fileformatutils/debugCodes.h>
 #include <fileformatutils/images.h>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <pxr/base/tf/fileUtils.h>
-#include <pxr/imaging/hio/image.h>
+#include <pxr/usd/ar/asset.h>
 #include <pxr/usd/ar/defaultResolver.h>
+#include <pxr/usd/ar/resolvedPath.h>
 
 using namespace PXR_NS;
 
@@ -539,29 +542,77 @@ _getAssetFileExtension(const std::string& resolvedAssetPath)
     return TfStringToLower(ArGetResolver().GetExtension(resolvedAssetPath));
 }
 
+namespace {
+// Bound reads explicitly: decoders may request blocks extending beyond EOF.
+// Use ArAsset directly to support package assets without copying the whole file.
+class AssetImageReader : public OIIO::Filesystem::IOProxy
+{
+public:
+    explicit AssetImageReader(std::shared_ptr<ArAsset> asset)
+      : IOProxy("", Read)
+      , m_asset(std::move(asset))
+    {}
+
+    const char* proxytype() const override { return "usdasset"; }
+    size_t size() const override { return m_asset->GetSize(); }
+    size_t pread(void* destination, size_t count, int64_t offset) override
+    {
+        if (offset < 0 || static_cast<uint64_t>(offset) >= size()) {
+            return 0;
+        }
+        count = std::min(count, size() - static_cast<size_t>(offset));
+        return m_asset->Read(destination, count, static_cast<size_t>(offset));
+    }
+    size_t read(void* destination, size_t count) override
+    {
+        const size_t bytes = pread(destination, count, m_pos);
+        m_pos += bytes;
+        return bytes;
+    }
+
+private:
+    std::shared_ptr<ArAsset> m_asset;
+};
+
+// Destroy the decoder before its proxy and the underlying USD asset.
+struct ResolvedImageInput
+{
+    std::shared_ptr<ArAsset> asset;
+    std::unique_ptr<AssetImageReader> reader;
+    std::unique_ptr<OIIO::ImageInput> input;
+
+    explicit ResolvedImageInput(const std::string& path)
+    {
+        asset = ArGetResolver().OpenAsset(ArResolvedPath(path));
+        if (!asset || asset->GetSize() == 0) {
+            TF_WARN("Could not open image asset %s", path.c_str());
+            return;
+        }
+        reader = std::make_unique<AssetImageReader>(asset);
+        OIIO::ImageSpec config;
+        void* proxy = reader.get();
+        config.attribute("oiio:ioproxy", OIIO::TypeDesc::PTR, &proxy);
+        config.attribute("oiio:UnassociatedAlpha", 1);
+        input = OIIO::ImageInput::open("asset." + _getAssetFileExtension(path), &config);
+        if (!input) {
+            TF_WARN("Could not decode image asset %s: %s", path.c_str(), OIIO::geterror().c_str());
+        }
+    }
+};
+}
+
 bool
 isImageFileSupported(const std::string& resolvedAssetPath)
 {
-    // Runtime cache for the supported file types. We don't expect the available plugins to change
-    // at run-time. The query to the HioImage::IsSupportedImageFile is quite expensive, so we cache
-    // it.
-    static std::unordered_map<std::string, bool> supportedExtensions;
-    // We want this to be multi-threading save, so we protect the cache
-    static std::mutex supportedExtensionsMutex;
-
-    std::lock_guard<std::mutex> lock(supportedExtensionsMutex);
-
-    std::string ext = _getAssetFileExtension(resolvedAssetPath);
-    auto [it, inserted] = supportedExtensions.emplace(ext, false);
-    if (inserted) {
-        it->second = HioImage::IsSupportedImageFile("filename." + ext);
-        if (!it->second) {
-            TF_WARN("Image file with extension '%s' at path '%s' is not supported",
-                    ext.c_str(),
-                    resolvedAssetPath.c_str());
-        }
+    const std::string ext = _getAssetFileExtension(resolvedAssetPath);
+    if (ext.empty()) {
+        return false;
     }
-    return it->second;
+    auto input = OIIO::ImageInput::create(ext);
+    if (!input) {
+        OIIO::geterror(); // A capability query should not leave a pending error.
+    }
+    return bool(input);
 }
 
 bool
@@ -596,31 +647,24 @@ getSbsarUsageFromParameters(const std::string& parametersStr)
 std::string
 getSbsarImageExtension(const std::string& resolvedAssetPath)
 {
-    if (!isImageFileSupported(resolvedAssetPath)) {
-        TF_WARN("Asset %s is not a supported image type", resolvedAssetPath.c_str());
+    ResolvedImageInput source(resolvedAssetPath);
+    if (!source.input) {
         return {};
     }
-
-    HioImageSharedPtr inputImage = HioImage::OpenForReading(resolvedAssetPath);
-    if (!inputImage) {
-        TF_WARN("Couldn't open image %s for reading", resolvedAssetPath.c_str());
+    const auto is_float = [](OIIO::TypeDesc type) {
+        return type.basetype == OIIO::TypeDesc::HALF || type.basetype == OIIO::TypeDesc::FLOAT ||
+               type.basetype == OIIO::TypeDesc::DOUBLE;
+    };
+    const auto& spec = source.input->spec();
+    bool floating_point = is_float(spec.format);
+    for (const auto& format : spec.channelformats) {
+        floating_point |= is_float(format);
+    }
+    if (!source.input->close()) {
+        TF_WARN("Could not close image asset %s", resolvedAssetPath.c_str());
         return {};
     }
-
-    HioFormat hioFormat = inputImage->GetFormat();
-
-    // Floating point images are stored as exr files
-    if (hioFormat == HioFormatFloat16 || hioFormat == HioFormatFloat16Vec2 ||
-        hioFormat == HioFormatFloat16Vec3 || hioFormat == HioFormatFloat16Vec4 ||
-        hioFormat == HioFormatFloat32 || hioFormat == HioFormatFloat32Vec2 ||
-        hioFormat == HioFormatFloat32Vec3 || hioFormat == HioFormatFloat32Vec4 ||
-        hioFormat == HioFormatDouble64 || hioFormat == HioFormatDouble64Vec2 ||
-        hioFormat == HioFormatDouble64Vec3 || hioFormat == HioFormatDouble64Vec4) {
-        return std::string("exr");
-    }
-
-    // All other images are most likely textures and we default to png
-    return std::string("png");
+    return floating_point ? "exr" : "png";
 }
 
 // This function extracts a usable file path from an assetPath, which might be a bit funky:
@@ -679,77 +723,36 @@ transcodeImageAssetToMemory(const std::string& resolvedAssetPath,
                             const std::string& filename,
                             std::vector<uint8_t>& outputPixelData)
 {
-    if (!isImageFileSupported(resolvedAssetPath)) {
-        TF_WARN("Asset %s is not a supported image type", resolvedAssetPath.c_str());
+    outputPixelData.clear();
+    ResolvedImageInput source(resolvedAssetPath);
+    if (!source.input) {
         return false;
     }
-
-    // Define the temporary directory path and create it if it doesn't exist
-    std::filesystem::path tempDir = std::filesystem::temp_directory_path() / "transcoded_images";
-    if (!std::filesystem::exists(tempDir)) {
-        if (!createDirectory(tempDir)) {
-            TF_WARN("Failed to create temporary directory: %s", tempDir.string().c_str());
-            return false;
-        }
-    }
-
-    std::filesystem::path filePath = tempDir / filename;
-    if (!isImageFileSupported(filePath.string())) {
-        TF_WARN("Output %s is not a supported image type", filePath.c_str());
+    std::vector<uint8_t> encoded;
+    OIIO::Filesystem::IOVecOutput writer(encoded);
+    auto output = OIIO::ImageOutput::create(filename, &writer);
+    if (!output || !output->supports("ioproxy")) {
+        const std::string error = output ? output->geterror() : OIIO::geterror();
+        TF_WARN("No memory-backed image encoder for %s: %s", filename.c_str(), error.c_str());
         return false;
     }
-
-    HioImageSharedPtr inputImage = HioImage::OpenForReading(resolvedAssetPath);
-    if (!inputImage) {
-        TF_WARN("Couldn't open image %s for reading", resolvedAssetPath.c_str());
+    OIIO::ImageSpec spec = source.input->spec();
+    spec.attribute("oiio:UnassociatedAlpha", 1);
+    if (!output->open(filename, spec)) {
+        TF_WARN(
+          "Could not open image encoder for %s: %s", filename.c_str(), output->geterror().c_str());
         return false;
     }
-
-    HioImage::StorageSpec storage;
-    storage.width = inputImage->GetWidth();
-    storage.height = inputImage->GetHeight();
-    storage.format = inputImage->GetFormat();
-    int bytesPerPixel = inputImage->GetBytesPerPixel();
-    std::vector<uint8_t> pixelData(storage.width * storage.height * bytesPerPixel);
-    storage.data = pixelData.data();
-
-    if (!inputImage->Read(storage)) {
-        TF_WARN("Reading of image %s failed", resolvedAssetPath.c_str());
+    bool ok = output->copy_image(source.input.get());
+    // Both close calls must run even after a copy failure. Encoders can fail
+    // while flushing, so publish the output only after successful finalization.
+    ok = output->close() && ok;
+    ok = source.input->close() && ok;
+    if (!ok) {
+        TF_WARN("Could not transcode image %s to %s", resolvedAssetPath.c_str(), filename.c_str());
         return false;
     }
-
-    HioImageSharedPtr outputImage = HioImage::OpenForWriting(filePath.string());
-    if (!outputImage) {
-        TF_WARN("Couldn't open image %s for writing", filePath.string().c_str());
-        return false;
-    }
-
-    // Unfortunately, with the HioImage API and there is no way to write to memory
-    // and have it encoded to PNG or another format.  We could refactor this in the
-    // future to use OIIO.
-    if (!outputImage->Write(storage)) {
-        TF_WARN("Writing of image %s failed", filePath.string().c_str());
-        return false;
-    }
-
-    // Read the output image file as binary data into outputPixelData
-    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
-    if (!file) {
-        TF_WARN("Couldn't open outputImage %s for reading", filePath.string().c_str());
-        return false;
-    }
-
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    outputPixelData.resize(size);
-    if (!file.read(reinterpret_cast<char*>(outputPixelData.data()), size)) {
-        TF_WARN("Reading of transcoded image %s failed", filePath.string().c_str());
-        return false;
-    }
-
-    TF_STATUS("Transcoded image: %s -> %s and populated memory buffer",
-              resolvedAssetPath.c_str(),
-              filePath.string().c_str());
+    outputPixelData = std::move(encoded);
     return true;
 }
 

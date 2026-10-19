@@ -125,7 +125,6 @@ PUBLIC
     usdShade
     usdUtils
     usdVol
-    hio
     arch
     ZLIB::ZLIB
 )
