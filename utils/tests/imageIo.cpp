@@ -34,6 +34,31 @@ main(int argc, char** argv)
     try {
         check(argc == 2, "Pass an existing temporary directory for test artifacts");
         const std::filesystem::path scratch(argv[1]);
+        // One BC1 block: every pixel selects the red RGB565 endpoint.
+        std::array<uint32_t, 32> dds_header{};
+        dds_header[0] = 0x20534444;
+        dds_header[1] = 124;
+        dds_header[2] = 0x81007;
+        dds_header[3] = dds_header[4] = 4;
+        dds_header[5] = 8;
+        dds_header[19] = 32;
+        dds_header[20] = 4;
+        dds_header[21] = 0x31545844;
+        dds_header[27] = 0x1000;
+        adobe::usd::ImageAsset dds;
+        dds.format = adobe::usd::getFormat("dds");
+        dds.uri = "red.dds";
+        dds.image.resize(136);
+        std::memcpy(dds.image.data(), dds_header.data(), 128);
+        dds.image[129] = 0xf8;
+        adobe::usd::Image decoded_dds;
+        check(adobe::usd::getFormatExtension(dds.format) == "dds", "DDS format mapping missing");
+        check(decoded_dds.read(dds), "Cannot decode BC1 DDS in Adobe material helpers");
+        check(decoded_dds.width == 4 && decoded_dds.height == 4 && decoded_dds.channels >= 3,
+              "Wrong DDS shape");
+        check(decoded_dds.pixels[0] == 1 && decoded_dds.pixels[1] == 0 &&
+                decoded_dds.pixels[2] == 0,
+              "Wrong DDS color");
         const auto png_path = scratch / "rgba.png";
         const std::array<uint8_t, 16> pixels{ 255, 0, 0,   0,   0,  255, 0,  128,
                                               0,   0, 255, 255, 64, 32,  16, 192 };

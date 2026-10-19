@@ -363,7 +363,9 @@ getFormat(const std::string& extension)
     std::string s = TfStringToLower(extension);
     trim(s);
 
-    if (s == "bmp")
+    if (s == "dds")
+        return ImageFormatDds;
+    else if (s == "bmp")
         return ImageFormatBmp;
     else if (s == "exr")
         return ImageFormatExr;
@@ -394,6 +396,8 @@ std::string
 getFormatExtension(ImageFormat format)
 {
     switch (format) {
+        case ImageFormatDds:
+            return "dds";
         case ImageFormatBmp:
             return "bmp";
         case ImageFormatExr:

@@ -299,6 +299,7 @@ enum USDFFUTILS_API ImageFormat
     ImageFormatTiff,
     ImageFormatWebp,
     ImageFormatHdr,
+    ImageFormatDds,
 };
 
 struct USDFFUTILS_API ImageAsset

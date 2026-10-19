@@ -10,3 +10,6 @@ asset reads. Tests cover package-relative images, unassociated alpha, orientatio
 stored color values, HDR EXR, memory encoding and input/encoder failures.
 Hio-backed procedural image providers such as SBSAR are not supported by this
 replacement. Making the backend selectable is separate upstream integration work.
+
+DDS coverage constructs a BC1 red block and verifies format mapping, decoded
+size and pixel values through the material image helpers.
