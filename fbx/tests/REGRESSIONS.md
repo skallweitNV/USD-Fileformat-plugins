@@ -11,3 +11,7 @@ contains an unnamed texture reference and a mesh with large nonuniform scale.
 
 `duplicate_texture_names.fbx` references `a/shared.png` and `b/shared.png`;
 the test generates red and green images in those locations.
+
+`cubic_camera_pivot.fbx` uses meters and 24 fps. It contains a cubic camera
+translation, a linear two-revolution Euler rotation around a pivot, and both
+constant interpolation modes. Its clip spans two seconds.

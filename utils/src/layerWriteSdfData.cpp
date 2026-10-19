@@ -455,13 +455,22 @@ _writeXformAttributes(SdfAbstractData* sdfData, const SdfPath& primPath, const N
     bool hasRotation = node.rotation != GfQuatf(0);
     if (hasRotation || nodeAnimation.rotations.times.size()) {
         SdfPath p =
-          createAttributeSpec(sdfData, primPath, _tokens->xformOpOrient, SdfValueTypeNames->Quatf);
+          createAttributeSpec(sdfData, primPath, _tokens->xformOpOrient, SdfValueTypeNames->Quatd);
         xformOpOrder.push_back(_tokens->xformOpOrient);
 
         if (hasRotation) {
-            setAttributeDefaultValue(sdfData, p, node.rotation, SdfValueTypeNames->Quatf);
+            setAttributeDefaultValue(
+              sdfData, p, GfQuatd(node.rotation).GetNormalized(), SdfValueTypeNames->Quatd);
         }
-        _writeTimeSamples(sdfData, p, nodeAnimation.rotations);
+        // Normalize in double precision: small float quaternion length errors
+        // become visible angular errors in USD's axis-angle conversion.
+        TimeValues<GfQuatd> rotations;
+        rotations.times = nodeAnimation.rotations.times;
+        rotations.values.reserve(nodeAnimation.rotations.values.size());
+        for (const auto& rotation : nodeAnimation.rotations.values) {
+            rotations.values.push_back(GfQuatd(rotation).GetNormalized());
+        }
+        _writeTimeSamples(sdfData, p, rotations);
     }
     bool hasScale = node.scale != GfVec3f(1);
     if (hasScale || nodeAnimation.scales.times.size()) {

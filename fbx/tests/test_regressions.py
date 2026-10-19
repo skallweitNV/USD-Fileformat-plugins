@@ -93,3 +93,20 @@ def test_large_nonuniform_scale() -> None:
     np.testing.assert_allclose(
         matrix, np.diag([100000, 3.5355439387, 4, 1]), rtol=1e-6, atol=1e-7
     )
+
+
+def test_normalized_double_orientations() -> None:
+    stage = open_fbx(DATA / "cubic_camera_pivot.fbx")
+    orientations = [
+        a
+        for p in stage.Traverse()
+        for a in p.GetAttributes()
+        if a.GetName() == "xformOp:orient"
+    ]
+    assert orientations
+    for attribute in orientations:
+        assert attribute.GetTypeName() == Sdf.ValueTypeNames.Quatd
+        for time in [Usd.TimeCode.Default(), *attribute.GetTimeSamples()]:
+            value = attribute.Get(time)
+            if value is not None:
+                assert abs(value.GetLength() - 1) < 1e-14
