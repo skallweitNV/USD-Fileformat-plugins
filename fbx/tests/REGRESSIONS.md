@@ -24,3 +24,8 @@ world-space error bound. Node orientations use normalized double samples.
 Dense joint hierarchies can be expensive: a production Sol asset took about
 30 minutes. The skeletal curve sampler is unchanged. Arbitrary affine/sheared
 inheritance is outside these regression checks.
+
+Mode tests verify default and explicit adaptive motion, sparse original-key
+sampling (including its expected loss of held transitions and full revolutions),
+same-file layer coexistence, invalid mode diagnostics and dynamic payload
+recomposition. No spline mode is implemented or reserved.

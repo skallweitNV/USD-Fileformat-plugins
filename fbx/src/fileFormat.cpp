@@ -29,6 +29,7 @@ PXR_NAMESPACE_OPEN_SCOPE
 
 static std::mutex mutex;
 const TfToken UsdFbxFileFormat::animationStacksToken("fbxAnimationStacks", TfToken::Immortal);
+const TfToken UsdFbxFileFormat::animationModeToken("animationMode", TfToken::Immortal);
 const TfToken UsdFbxFileFormat::assetsPathToken("fbxAssetsPath", TfToken::Immortal);
 const TfToken UsdFbxFileFormat::importLightsToken("importLights", TfToken::Immortal);
 const TfToken UsdFbxFileFormat::originalColorSpaceToken("fbxOriginalColorSpace", TfToken::Immortal);
@@ -69,6 +70,7 @@ UsdFbxFileFormat::InitData(const FileFormatArguments& args) const
     argWarnDeprecatedArg(args, assetsPathToken.GetString(), DEBUG_TAG);
 
     argReadBool(args, animationStacksToken.GetString(), pd->animationStacks, DEBUG_TAG);
+    argReadString(args, animationModeToken.GetString(), pd->animationMode, DEBUG_TAG);
     argReadBool(args, importLightsToken.GetString(), pd->importLights, DEBUG_TAG);
     argReadBool(args, phongToken.GetString(), pd->phong, DEBUG_TAG);
     argReadBool(args, triangulateMeshesToken.GetString(), pd->triangulateMeshes, DEBUG_TAG);
@@ -82,6 +84,7 @@ UsdFbxFileFormat::ComposeFieldsForFileFormatArguments(const std::string& assetPa
                                                       VtValue* dependencyContextData) const
 {
     argComposeBool(context, args, animationStacksToken, DEBUG_TAG);
+    argComposeString(context, args, animationModeToken, DEBUG_TAG);
     argComposeString(context, args, assetsPathToken, DEBUG_TAG);
     argComposeBool(context, args, importLightsToken, DEBUG_TAG);
     argComposeBool(context, args, phongToken, DEBUG_TAG);
@@ -116,6 +119,13 @@ UsdFbxFileFormat::Read(SdfLayer* layer, const std::string& resolvedPath, bool me
     FbxDataConstPtr data = TfDynamic_cast<const FbxDataConstPtr>(layerData);
     UsdData usd;
     ImportFbxOptions options;
+    if (data->animationMode == "keyframes") {
+        options.animationMode = FBXAnimationMode::Keyframes;
+    } else if (data->animationMode != "adaptive") {
+        TF_RUNTIME_ERROR("Invalid animationMode '%s'; expected 'keyframes' or 'adaptive'.",
+                         data->animationMode.c_str());
+        return false;
+    }
     options.importGeometry = true;
     options.importMaterials = true;
     options.importImages = !data->assetsPath.empty();

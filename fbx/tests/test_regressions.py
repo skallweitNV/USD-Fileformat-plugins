@@ -13,23 +13,23 @@ import zlib
 
 import numpy as np
 import pytest
-from pxr import Ar, Sdf, Usd, UsdGeom, UsdShade
+from pxr import Ar, Sdf, Tf, Usd, UsdGeom, UsdShade
 
 DATA = Path(__file__).parent / "data"
 
 
-def open_fbx(path: Path) -> Usd.Stage:
+def open_fbx(path: Path, animation_mode: str | None = None) -> Usd.Stage:
     assert Sdf.FileFormat.FindByExtension(
         "fbx"
     ), "Register the usdFbx plugin before running tests"
-    layer = Sdf.Layer.FindOrOpen(
-        str(path),
-        {
-            "writeUsdPreviewSurface": "true",
-            "writeOpenPBR": "false",
-            "writeASM": "false",
-        },
-    )
+    args = {
+        "writeUsdPreviewSurface": "true",
+        "writeOpenPBR": "false",
+        "writeASM": "false",
+    }
+    if animation_mode is not None:
+        args["animationMode"] = animation_mode
+    layer = Sdf.Layer.FindOrOpen(str(path), args)
     assert layer
     stage = Usd.Stage.Open(layer)
     assert stage
@@ -120,9 +120,10 @@ def test_source_frame_timing() -> None:
     assert stage.GetEndTimeCode() == 48
 
 
+@pytest.mark.parametrize("animation_mode", [None, "adaptive"])
 @pytest.mark.parametrize("kind", ["camera", "pivot", "held", "held_next"])
-def test_animation_between_source_keys(kind: str) -> None:
-    stage = open_fbx(DATA / "cubic_camera_pivot.fbx")
+def test_animation_between_source_keys(kind: str, animation_mode: str | None) -> None:
+    stage = open_fbx(DATA / "cubic_camera_pivot.fbx", animation_mode)
     names = {
         "camera": "CubicCamera",
         "pivot": "OrbitingTriangle",
@@ -161,3 +162,89 @@ def test_animation_between_source_keys(kind: str) -> None:
             np.testing.assert_allclose(
                 np.asarray(matrix)[:3, :3], basis, atol=1e-5, rtol=0
             )
+
+
+def test_animation_modes_coexist() -> None:
+    source = DATA / "cubic_camera_pivot.fbx"
+    default = open_fbx(source)
+    adaptive = open_fbx(source, "adaptive")
+    keyframes = open_fbx(source, "keyframes")
+    assert adaptive.GetRootLayer().identifier != keyframes.GetRootLayer().identifier
+    assert (
+        default.GetRootLayer().ExportToString()
+        == adaptive.GetRootLayer().ExportToString()
+    )
+    camera_path = next(
+        p.GetPath() for p in keyframes.Traverse() if p.GetName() == "CubicCamera"
+    )
+    sparse = UsdGeom.Xformable(keyframes.GetPrimAtPath(camera_path))
+    dense = UsdGeom.Xformable(adaptive.GetPrimAtPath(camera_path))
+    assert sparse.GetTimeSamples() == [0, 48]
+    assert len(dense.GetTimeSamples()) > 2
+    # Half a second: linear interpolation gives 2.5; the source cubic gives 1.5625.
+    assert sparse.ComputeLocalToWorldTransform(12).ExtractTranslation()[
+        0
+    ] == pytest.approx(2.5)
+    assert dense.ComputeLocalToWorldTransform(12).ExtractTranslation()[
+        0
+    ] == pytest.approx(1.5625, abs=5e-4)
+    for time in (0, 48):
+        np.testing.assert_allclose(
+            sparse.ComputeLocalToWorldTransform(time),
+            dense.ComputeLocalToWorldTransform(time),
+            atol=1e-6,
+        )
+    for stage in (keyframes, adaptive):
+        assert stage.GetTimeCodesPerSecond() == stage.GetFramesPerSecond() == 24
+        assert stage.GetEndTimeCode() == 48
+
+
+@pytest.mark.parametrize("name", ["Held", "HeldNext"])
+def test_keyframes_does_not_add_held_samples(name: str) -> None:
+    stage = open_fbx(DATA / "cubic_camera_pivot.fbx", "keyframes")
+    prim = next(p for p in stage.Traverse() if p.GetName() == name)
+    transform = UsdGeom.Xformable(prim)
+    assert transform.GetTimeSamples() == [0, 24, 48]
+    assert transform.ComputeLocalToWorldTransform(12).ExtractTranslation()[
+        0
+    ] == pytest.approx(5)
+
+
+def test_keyframes_does_not_reconstruct_full_revolutions() -> None:
+    stage = open_fbx(DATA / "cubic_camera_pivot.fbx", "keyframes")
+    prim = next(p for p in stage.Traverse() if p.GetName() == "OrbitingTriangle")
+    transform = UsdGeom.Xformable(prim)
+    np.testing.assert_allclose(
+        transform.ComputeLocalToWorldTransform(12).ExtractTranslation(),
+        (6, 0, 0),
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("mode", ["splines", "unknown", "", "Adaptive"])
+def test_invalid_animation_mode(mode: str) -> None:
+    with pytest.raises(Tf.ErrorException, match="animationMode.*keyframes.*adaptive"):
+        open_fbx(DATA / "cubic_camera_pivot.fbx", mode)
+
+
+def test_animation_mode_payload_recomposition() -> None:
+    source = open_fbx(DATA / "cubic_camera_pivot.fbx", "adaptive")
+    stage = Usd.Stage.CreateInMemory()
+    prim = stage.DefinePrim("/Asset")
+    prim.SetMetadata("animationMode", "keyframes")
+    prim.GetPayloads().AddPayload(
+        str(DATA / "cubic_camera_pivot.fbx"), source.GetDefaultPrim().GetPath()
+    )
+    camera = next(p for p in stage.Traverse() if p.GetName() == "CubicCamera")
+    path = camera.GetPath()
+    sparse = UsdGeom.Xformable(camera)
+    assert sparse.GetTimeSamples() == [0, 48]
+    assert sparse.ComputeLocalToWorldTransform(12).ExtractTranslation()[
+        0
+    ] == pytest.approx(2.5)
+    prim.SetMetadata("animationMode", "adaptive")
+    dense = UsdGeom.Xformable(stage.GetPrimAtPath(path))
+    assert len(dense.GetTimeSamples()) > 2
+    assert dense.ComputeLocalToWorldTransform(12).ExtractTranslation()[
+        0
+    ] == pytest.approx(1.5625, abs=5e-4)

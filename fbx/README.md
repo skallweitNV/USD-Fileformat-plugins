@@ -160,6 +160,39 @@ Note that PBR materials are not supported on export, only Phong
     stage = Usd.Stage.Open("cube.fbx:SDF_FORMAT_ARGS:fbxOriginalColorSpace=sRGB")
     ```
 
+* `animationMode`: Sampling policy for node transforms, including cameras. Default is `"adaptive"`.
+
+    The accepted values are exactly `"keyframes"` and `"adaptive"` (case-sensitive).
+    Unknown or empty values fail import with a diagnostic listing the supported modes.
+
+    `keyframes` evaluates the FBX SDK transform at the union of original key times
+    on each node's animated properties and layers, then authors USD TRS time samples.
+    It adds neither source-frame samples nor one-sided samples for held transitions.
+    Translation and scale interpolate linearly; orientations use quaternion interpolation.
+    Curved motion, pivot paths, held transitions and complete Euler revolutions may be lost.
+
+    `adaptive` starts with original keys and source-frame samples, preserves held
+    transitions with one-sided samples and refines intervals against SDK evaluation.
+    It retains the existing refinement tolerances and approximates motion using
+    ordinary USD time samples; it does not author source curve tangents or splines.
+
+    Both modes retain source-frame time codes and the same transform decomposition.
+    Constant channels may be reduced to their endpoints. Skeletal animation sampling
+    is unchanged. This option does not control animated camera lens properties or
+    other non-transform attributes.
+
+    ```python
+    from pxr import Sdf, Usd
+    layer = Sdf.Layer.FindOrOpen("scene.fbx", {"animationMode": "keyframes"})
+    stage = Usd.Stage.Open(layer)
+    stage.Export("scene.usdc")
+    ```
+
+    Arguments are part of the USD layer identifier, so both modes can coexist for
+    the same FBX. `animationMode` can also be authored as prim metadata for a dynamic
+    FBX payload; changing it recomposes the payload. Once exported to USD, changing
+    this option does not alter the exported samples: reopen the FBX with the desired mode.
+
 * `fbxAnimationStacks`: Import multiple animation stacks. Default is `false`
 
     By default only the first animation stack is imported.

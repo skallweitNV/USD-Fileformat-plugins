@@ -21,6 +21,18 @@
                         "documentation:": "Whether to import multiple animation stacks (by default only the first stack is imported)",
                         "type": "bool"
                     },
+                    "animationMode": {
+                        "appliesTo": [ "prims" ],
+                        "displayGroup": "Core",
+                        "documentation": "Node transform sampling: keyframes or adaptive (default). Skeletal sampling is unchanged.",
+                        "type": "string"
+                    },
+                    "importLights": {
+                        "appliesTo": [ "prims" ],
+                        "displayGroup": "Core",
+                        "documentation": "Whether to import lights from FBX (default true).",
+                        "type": "bool"
+                    },
                     "fbxOriginalColorSpace": {
                         "appliesTo": [ "prims" ],
                         "displayGroup": "Core",

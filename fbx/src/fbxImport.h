@@ -15,6 +15,13 @@ governing permissions and limitations under the License.
 
 namespace adobe::usd {
 
+/// Sampling policy for ordinary node transforms; skeletal sampling is unchanged.
+enum class FBXAnimationMode
+{
+    Keyframes,
+    Adaptive,
+};
+
 struct ImportFbxOptions
 {
     bool importGeometry = true;
@@ -24,6 +31,7 @@ struct ImportFbxOptions
     bool importPhong = false;
     bool importAnimationStacks = false;
     bool triangulateMeshes = true;
+    FBXAnimationMode animationMode = FBXAnimationMode::Adaptive;
     PXR_NS::TfToken originalColorSpace;
 };
 

@@ -238,6 +238,7 @@ importFbxTransform(ImportFbxContext& ctx,
     // Animated skeleton nodes get their animations from the skeletal animation system
     bool isAnimatedSkeletonNode =
       (ctx.animatedSkeletonNodes.find(fbxNode) != ctx.animatedSkeletonNodes.end());
+    const bool adaptive = ctx.options->animationMode == FBXAnimationMode::Adaptive;
     if (!isAnimatedSkeletonNode) {
         for (int animationStackIndex = 0;
              animationStackIndex < static_cast<int>(ctx.animationStacks.size());
@@ -252,14 +253,15 @@ importFbxTransform(ImportFbxContext& ctx,
             std::set<FbxTime> keyFrameTimes;
 
             // Helper function to get the times of every keyframe from a particular animation curve
-            auto addFrameTimes = [&keyFrameTimes](const FbxAnimCurve* curve) {
+            auto addFrameTimes = [&keyFrameTimes, adaptive](const FbxAnimCurve* curve) {
                 if (curve != nullptr) {
                     // We found animation data, so we extract every keyframe to process below
                     int keyCount = curve->KeyGetCount();
                     for (int keyIndex = 0; keyIndex < keyCount; ++keyIndex) {
                         keyFrameTimes.insert(curve->KeyGetTime(keyIndex));
-                        if (keyIndex + 1 < keyCount && curve->KeyGetInterpolation(keyIndex) ==
-                                                         FbxAnimCurveDef::eInterpolationConstant) {
+                        if (adaptive && keyIndex + 1 < keyCount &&
+                            curve->KeyGetInterpolation(keyIndex) ==
+                              FbxAnimCurveDef::eInterpolationConstant) {
                             // Preserve both constant modes with one-sided samples.
                             // Times are stored as floats by NodeAnimation, so use
                             // adjacent representable floats rather than FBX ticks.
@@ -330,7 +332,7 @@ importFbxTransform(ImportFbxContext& ctx,
                 }
                 return it->second;
             };
-            if (keyFrameTimes.size() > 1) {
+            if (adaptive && keyFrameTimes.size() > 1) {
                 double fps = FbxTime::GetFrameRate(ctx.scene->GetGlobalSettings().GetTimeMode());
                 if (fps <= 0)
                     fps = ctx.scene->GetGlobalSettings().GetCustomFrameRate();
@@ -457,7 +459,7 @@ importFbxTransform(ImportFbxContext& ctx,
             compactConstant(nodeAnimation.rotations);
             compactConstant(nodeAnimation.scales);
             TF_DEBUG_MSG(FILE_FORMAT_FBX,
-                         "Baked node %s: %zu transform samples\n",
+                         "Sampled node %s: %zu transform samples\n",
                          fbxNode->GetName(),
                          numKeyFrames);
         }
