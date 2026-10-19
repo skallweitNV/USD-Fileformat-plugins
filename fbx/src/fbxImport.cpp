@@ -2496,6 +2496,12 @@ importFbxMaterials(ImportFbxContext& ctx)
         // key. But otherwise we shouldn't use it as it won't be valid if the FBX file has been
         // shared with another user after it was created.
         std::string origAbsFileName = fileTexture->GetFileName();
+        // Empty FBX texture slots are not image dependencies. Resolving an
+        // empty relative name would otherwise treat the source directory as
+        // an image and fail bump/specular processing.
+        if (origAbsFileName.empty() && std::string(fileTexture->GetRelativeFileName()).empty()) {
+            continue;
+        }
         auto embedded = ctx.fbx->embeddedData.find(origAbsFileName);
         bool isEmbedded = embedded != ctx.fbx->embeddedData.end();
 
