@@ -14,6 +14,7 @@ governing permissions and limitations under the License.
 #include "debugCodes.h"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <fileformatutils/common.h>
 #include <fileformatutils/featureFlags.h>
 #include <fileformatutils/images.h>
@@ -21,7 +22,10 @@ governing permissions and limitations under the License.
 #include <fileformatutils/usdData.h>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
+#include <limits>
+#include <map>
 #include <pxr/base/tf/fileUtils.h>
 #include <pxr/base/tf/pathUtils.h>
 #include <pxr/base/tf/stringUtils.h>
@@ -254,6 +258,22 @@ importFbxTransform(ImportFbxContext& ctx,
                     int keyCount = curve->KeyGetCount();
                     for (int keyIndex = 0; keyIndex < keyCount; ++keyIndex) {
                         keyFrameTimes.insert(curve->KeyGetTime(keyIndex));
+                        if (keyIndex + 1 < keyCount && curve->KeyGetInterpolation(keyIndex) ==
+                                                         FbxAnimCurveDef::eInterpolationConstant) {
+                            // Preserve both constant modes with one-sided samples.
+                            // Times are stored as floats by NodeAnimation, so use
+                            // adjacent representable floats rather than FBX ticks.
+                            const float first = curve->KeyGetTime(keyIndex).GetSecondDouble();
+                            const float last = curve->KeyGetTime(keyIndex + 1).GetSecondDouble();
+                            FbxTime afterFirst, beforeLast;
+                            const double tick = 2.0 / FBXSDK_TC_SECOND;
+                            afterFirst.SetSecondDouble(std::max(
+                              double(std::nextafter(first, INFINITY)), double(first) + tick));
+                            beforeLast.SetSecondDouble(std::min(
+                              double(std::nextafter(last, -INFINITY)), double(last) - tick));
+                            keyFrameTimes.insert(afterFirst);
+                            keyFrameTimes.insert(beforeLast);
+                        }
                     }
                 }
             };
@@ -281,6 +301,107 @@ importFbxTransform(ImportFbxContext& ctx,
                 }
             }
 
+            // FBX curves can be cubic, and even linear Euler curves produce
+            // nonlinear TRS when pivots are present. Original keys alone also
+            // lose complete revolutions when converted to quaternions. Evaluate
+            // a dense base grid, then refine intervals against SDK evaluation.
+            struct TransformSample
+            {
+                GfVec3f translation;
+                GfQuatf rotation;
+                GfVec3f scale;
+            };
+            std::map<FbxTime, TransformSample> samples;
+            auto evaluate = [&](FbxTime time) -> const TransformSample& {
+                auto [it, inserted] = samples.try_emplace(time);
+                if (inserted) {
+                    auto& value = it->second;
+                    decomposeTransformation(value.translation,
+                                            value.rotation,
+                                            value.scale,
+                                            useGlobalTransform
+                                              ? fbxNode->EvaluateGlobalTransform(time)
+                                              : fbxNode->EvaluateLocalTransform(time));
+                    if (hasNearZeroFbxScale(fbxNode->LclScaling.EvaluateValue(time)) ||
+                        hasNearZeroDecomposedScale(value.scale)) {
+                        value.rotation = toQuatf(fbxNode->LclRotation.EvaluateValue(time));
+                        value.rotation.Normalize();
+                    }
+                }
+                return it->second;
+            };
+            if (keyFrameTimes.size() > 1) {
+                double fps = FbxTime::GetFrameRate(ctx.scene->GetGlobalSettings().GetTimeMode());
+                if (fps <= 0)
+                    fps = ctx.scene->GetGlobalSettings().GetCustomFrameRate();
+                if (fps <= 0)
+                    fps = 24;
+                const double rate = fps;
+                const double start = keyFrameTimes.begin()->GetSecondDouble();
+                const double stop = keyFrameTimes.rbegin()->GetSecondDouble();
+                for (double frame = std::ceil(start * rate); frame < stop * rate; ++frame) {
+                    FbxTime time;
+                    time.SetSecondDouble(frame / rate);
+                    keyFrameTimes.insert(time);
+                }
+                const double positionTolerance = 1e-4 / std::max(ctx.usd->metersPerUnit, 1e-12);
+                auto differs = [&](const TransformSample& a,
+                                   const TransformSample& b,
+                                   const TransformSample& actual,
+                                   double alpha) {
+                    const GfVec3d translation =
+                      (1 - alpha) * GfVec3d(a.translation) + alpha * GfVec3d(b.translation);
+                    const double rounding = 4 * std::numeric_limits<float>::epsilon() *
+                                            std::max(translation.GetLength(), 1.0);
+                    if ((translation - GfVec3d(actual.translation)).GetLength() >
+                        std::max(positionTolerance, rounding))
+                        return true;
+                    const GfVec3d scale = (1 - alpha) * GfVec3d(a.scale) + alpha * GfVec3d(b.scale);
+                    if ((scale - GfVec3d(actual.scale)).GetLength() >
+                        1e-6 * std::max(scale.GetLength(), 1.0))
+                        return true;
+                    // Match USD's orient evaluation, including its close-angle
+                    // linear quaternion interpolation and axis-angle conversion.
+                    GfQuatd rotation = GfRotation(GfSlerp(alpha,
+                                                          GfQuatd(a.rotation).GetNormalized(),
+                                                          GfQuatd(b.rotation).GetNormalized()))
+                                         .GetQuat();
+                    const GfQuatd target = GfQuatd(actual.rotation).GetNormalized();
+                    const double dot = rotation.GetReal() * target.GetReal() +
+                                       GfDot(rotation.GetImaginary(), target.GetImaginary());
+                    if (dot < 0)
+                        rotation = -rotation;
+                    const double real = rotation.GetReal() - target.GetReal();
+                    const GfVec3d imaginary =
+                      GfVec3d(rotation.GetImaginary()) - target.GetImaginary();
+                    return real * real + imaginary.GetLengthSq() > 4e-12;
+                };
+                std::function<void(FbxTime, FbxTime, int)> refine;
+                refine = [&](FbxTime first, FbxTime last, int depth) {
+                    const double a = first.GetSecondDouble(), b = last.GetSecondDouble();
+                    if (depth == 12 || std::nextafter(float(a), INFINITY) >= float(b))
+                        return;
+                    const auto& left = evaluate(first);
+                    const auto& right = evaluate(last);
+                    bool split = false;
+                    for (double fraction : { 0.25, 0.5, 0.75 }) {
+                        FbxTime time;
+                        time.SetSecondDouble(a + fraction * (b - a));
+                        split |= differs(left, right, evaluate(time), fraction);
+                    }
+                    if (split) {
+                        FbxTime middle;
+                        middle.SetSecondDouble((a + b) * 0.5);
+                        keyFrameTimes.insert(middle);
+                        refine(first, middle, depth + 1);
+                        refine(middle, last, depth + 1);
+                    }
+                };
+                const std::vector<FbxTime> baseTimes(keyFrameTimes.begin(), keyFrameTimes.end());
+                for (size_t i = 1; i < baseTimes.size(); ++i)
+                    refine(baseTimes[i - 1], baseTimes[i], 0);
+            }
+
             size_t numKeyFrames = keyFrameTimes.size();
             if (numKeyFrames > 0) {
                 node.animations.resize(ctx.animationStacks.size());
@@ -306,25 +427,11 @@ importFbxTransform(ImportFbxContext& ctx,
             nodeAnimation.scales.values.reserve(numKeyFrames);
 
             for (auto keyFrameTime : keyFrameTimes) {
-                GfVec3f translation;
-                GfQuatf rotation;
-                GfVec3f scale;
-                float time = keyFrameTime.GetSecondDouble();
-                decomposeTransformation(translation,
-                                        rotation,
-                                        scale,
-                                        useGlobalTransform
-                                          ? fbxNode->EvaluateGlobalTransform(keyFrameTime)
-                                          : fbxNode->EvaluateLocalTransform(keyFrameTime));
-
-                // Near-zero scale makes the composed matrix singular, so the
-                // decomposed rotation is unreliable.  Fall back to FBX's
-                // separate rotation channel.
-                if (hasNearZeroFbxScale(fbxNode->LclScaling.EvaluateValue(keyFrameTime)) ||
-                    hasNearZeroDecomposedScale(scale)) {
-                    rotation = toQuatf(fbxNode->LclRotation.EvaluateValue(keyFrameTime));
-                    rotation.Normalize();
-                }
+                const auto& value = evaluate(keyFrameTime);
+                const auto& translation = value.translation;
+                const auto& rotation = value.rotation;
+                const auto& scale = value.scale;
+                const float time = keyFrameTime.GetSecondDouble();
 
                 nodeAnimation.translations.times.push_back(time);
                 nodeAnimation.translations.values.push_back(translation);
@@ -335,6 +442,24 @@ importFbxTransform(ImportFbxContext& ctx,
                 nodeAnimation.scales.times.push_back(time);
                 nodeAnimation.scales.values.push_back(scale);
             }
+            // Constant channels need only their endpoints. Keep their sampled
+            // value, which may differ from the unanimated default transform.
+            auto compactConstant = [](auto& channel) {
+                if (channel.times.size() > 2 &&
+                    std::all_of(channel.values.begin(), channel.values.end(), [&](const auto& v) {
+                        return v == channel.values.front();
+                    })) {
+                    channel.times = { channel.times.front(), channel.times.back() };
+                    channel.values = { channel.values.front(), channel.values.back() };
+                }
+            };
+            compactConstant(nodeAnimation.translations);
+            compactConstant(nodeAnimation.rotations);
+            compactConstant(nodeAnimation.scales);
+            TF_DEBUG_MSG(FILE_FORMAT_FBX,
+                         "Baked node %s: %zu transform samples\n",
+                         fbxNode->GetName(),
+                         numKeyFrames);
         }
     }
 

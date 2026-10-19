@@ -118,3 +118,46 @@ def test_source_frame_timing() -> None:
     assert stage.GetFramesPerSecond() == 24
     assert stage.GetStartTimeCode() == 0
     assert stage.GetEndTimeCode() == 48
+
+
+@pytest.mark.parametrize("kind", ["camera", "pivot", "held", "held_next"])
+def test_animation_between_source_keys(kind: str) -> None:
+    stage = open_fbx(DATA / "cubic_camera_pivot.fbx")
+    names = {
+        "camera": "CubicCamera",
+        "pivot": "OrbitingTriangle",
+        "held": "Held",
+        "held_next": "HeldNext",
+    }
+    prim = next(p for p in stage.Traverse() if p.GetName() == names[kind])
+    transform = UsdGeom.Xformable(prim)
+    for seconds in (0, 0.125, 0.2375, 0.5, 0.999, 1, 1.001, 1.375, 1.75, 2):
+        if kind == "camera":
+            t = seconds / 2
+            expected = (10 * (3 * t * t - 2 * t * t * t), 0, 0)
+        elif kind == "pivot":
+            angle = 2 * np.pi * seconds
+            expected = (4 + 2 * np.cos(angle), 2 * np.sin(angle), 0)
+        elif kind == "held":
+            expected = (10 * int(seconds), 0, 0)
+        else:
+            expected = (10 * int(np.ceil(seconds)), 0, 0)
+        matrix = transform.ComputeLocalToWorldTransform(
+            seconds * stage.GetTimeCodesPerSecond()
+        )
+        np.testing.assert_allclose(
+            matrix.ExtractTranslation(),
+            expected,
+            atol=5e-4,
+            rtol=0,
+            err_msg=f"{kind} at {seconds}s",
+        )
+        if kind == "pivot":
+            basis = (
+                (np.cos(angle), np.sin(angle), 0),
+                (-np.sin(angle), np.cos(angle), 0),
+                (0, 0, 1),
+            )
+            np.testing.assert_allclose(
+                np.asarray(matrix)[:3, :3], basis, atol=1e-5, rtol=0
+            )
