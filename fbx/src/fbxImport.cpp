@@ -92,6 +92,17 @@ struct ImportFbxContext
     std::vector<ImportedFbxStack> animationStacks;
 };
 
+double
+getFbxFrameRate(FbxScene* scene)
+{
+    const auto& settings = scene->GetGlobalSettings();
+    const auto mode = settings.GetTimeMode();
+    // GetFrameRate(eCustom) uses SDK-global state, not this scene's custom rate.
+    const double fps =
+      mode == FbxTime::eCustom ? settings.GetCustomFrameRate() : FbxTime::GetFrameRate(mode);
+    return std::isfinite(fps) && fps > 0 ? fps : 24;
+}
+
 // Metadata on USD will be stored uniformily in the CustomLayerData dictionary.
 void
 importMetadata(ImportFbxContext& ctx)
@@ -239,6 +250,7 @@ importFbxTransform(ImportFbxContext& ctx,
     bool isAnimatedSkeletonNode =
       (ctx.animatedSkeletonNodes.find(fbxNode) != ctx.animatedSkeletonNodes.end());
     const bool adaptive = ctx.options->animationMode == FBXAnimationMode::Adaptive;
+    const bool resample = ctx.options->animationMode == FBXAnimationMode::Resample;
     if (!isAnimatedSkeletonNode) {
         for (int animationStackIndex = 0;
              animationStackIndex < static_cast<int>(ctx.animationStacks.size());
@@ -303,6 +315,24 @@ importFbxTransform(ImportFbxContext& ctx,
                 }
             }
 
+            if ((adaptive || resample) && keyFrameTimes.size() > 1) {
+                const double fps = resample && ctx.options->animationSampleRate > 0
+                                     ? ctx.options->animationSampleRate
+                                     : getFbxFrameRate(ctx.scene);
+                const FbxTime first = *keyFrameTimes.begin(), last = *keyFrameTimes.rbegin();
+                if (resample) {
+                    // Bake only frame times and endpoints. Held transitions are
+                    // represented at frame resolution without one-sided samples.
+                    keyFrameTimes = { first, last };
+                }
+                const double start = first.GetSecondDouble(), stop = last.GetSecondDouble();
+                for (double frame = std::ceil(start * fps); frame < stop * fps; ++frame) {
+                    FbxTime time;
+                    time.SetSecondDouble(frame / fps);
+                    keyFrameTimes.insert(time);
+                }
+            }
+
             // FBX curves can be cubic, and even linear Euler curves produce
             // nonlinear TRS when pivots are present. Original keys alone also
             // lose complete revolutions when converted to quaternions. Evaluate
@@ -351,16 +381,19 @@ importFbxTransform(ImportFbxContext& ctx,
                 }
                 return it->second;
             };
-            // Reserve half the requested error for evaluation and half for reduction.
+            // Resampling bounds reduction error only at baked frame times.
+            // Adaptive mode reserves half the error for evaluation and half for reduction.
+            const double errorBudget = adaptive ? 0.5 : 1.0;
             const double rotationChordTolerance =
-              2 * std::sin(ctx.options->animationRotationTolerance * 3.14159265358979323846 / 1440);
+              2 * std::sin(errorBudget * ctx.options->animationRotationTolerance *
+                           3.14159265358979323846 / 720);
             auto translationError =
               [&](const GfVec3f& a, const GfVec3f& b, const GfVec3f& actual, double alpha) {
                   const GfVec3d expected = (1 - alpha) * GfVec3d(a) + alpha * GfVec3d(b);
                   const double rounding =
                     4 * std::numeric_limits<float>::epsilon() * std::max(expected.GetLength(), 1.0);
                   const double positionTolerance =
-                    0.5 * ctx.options->animationPositionTolerance /
+                    errorBudget * ctx.options->animationPositionTolerance /
                     std::max(ctx.usd->metersPerUnit * parentStretch, 1e-12);
                   return (expected - GfVec3d(actual)).GetLength() /
                          std::max(positionTolerance, rounding);
@@ -369,7 +402,7 @@ importFbxTransform(ImportFbxContext& ctx,
               [&](const GfVec3f& a, const GfVec3f& b, const GfVec3f& actual, double alpha) {
                   const GfVec3d expected = (1 - alpha) * GfVec3d(a) + alpha * GfVec3d(b);
                   return (expected - GfVec3d(actual)).GetLength() /
-                         (0.5 * ctx.options->animationScaleTolerance *
+                         (errorBudget * ctx.options->animationScaleTolerance *
                           std::max(expected.GetLength(), 1.0));
               };
             auto rotationError =
@@ -409,19 +442,6 @@ importFbxTransform(ImportFbxContext& ctx,
                          rotationChordTolerance;
               };
             if (adaptive && keyFrameTimes.size() > 1) {
-                double fps = FbxTime::GetFrameRate(ctx.scene->GetGlobalSettings().GetTimeMode());
-                if (fps <= 0)
-                    fps = ctx.scene->GetGlobalSettings().GetCustomFrameRate();
-                if (fps <= 0)
-                    fps = 24;
-                const double rate = fps;
-                const double start = keyFrameTimes.begin()->GetSecondDouble();
-                const double stop = keyFrameTimes.rbegin()->GetSecondDouble();
-                for (double frame = std::ceil(start * rate); frame < stop * rate; ++frame) {
-                    FbxTime time;
-                    time.SetSecondDouble(frame / rate);
-                    keyFrameTimes.insert(time);
-                }
                 size_t limitedIntervals = 0;
                 double largestLimitedError = 0;
                 std::function<void(FbxTime, FbxTime, int)> refine;
@@ -563,7 +583,7 @@ importFbxTransform(ImportFbxContext& ctx,
                 channel.times.resize(output);
                 channel.values.resize(output);
             };
-            if (adaptive) {
+            if (adaptive || resample) {
                 reduce(nodeAnimation.translations, translationError);
                 reduce(nodeAnimation.rotations, rotationError);
                 reduce(nodeAnimation.scales, scaleError);
@@ -4258,11 +4278,7 @@ importFbx(const ImportFbxOptions& options, Fbx& fbx, UsdData& usd)
         // Keep internal evaluation in seconds, then author source-frame time
         // codes. Consumers such as Blender treat USD sample times as frames;
         // matching timeCodesPerSecond and framesPerSecond preserves duration.
-        double fps = FbxTime::GetFrameRate(ctx.scene->GetGlobalSettings().GetTimeMode());
-        if (fps <= 0)
-            fps = ctx.scene->GetGlobalSettings().GetCustomFrameRate();
-        if (fps <= 0)
-            fps = 24;
+        const double fps = getFbxFrameRate(ctx.scene);
         for (auto& track : usd.animationTracks) {
             track.minTime *= fps;
             track.maxTime *= fps;

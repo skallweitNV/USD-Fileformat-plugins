@@ -32,6 +32,7 @@ PXR_NAMESPACE_OPEN_SCOPE
 static std::mutex mutex;
 const TfToken UsdFbxFileFormat::animationStacksToken("fbxAnimationStacks", TfToken::Immortal);
 const TfToken UsdFbxFileFormat::animationModeToken("animationMode", TfToken::Immortal);
+const TfToken UsdFbxFileFormat::animationSampleRateToken("animationSampleRate", TfToken::Immortal);
 const TfToken UsdFbxFileFormat::animationPositionToleranceToken("animationPositionTolerance",
                                                                 TfToken::Immortal);
 const TfToken UsdFbxFileFormat::animationRotationToleranceToken("animationRotationTolerance",
@@ -81,6 +82,7 @@ UsdFbxFileFormat::InitData(const FileFormatArguments& args) const
 
     argReadBool(args, animationStacksToken.GetString(), pd->animationStacks, DEBUG_TAG);
     argReadString(args, animationModeToken.GetString(), pd->animationMode, DEBUG_TAG);
+    argReadString(args, animationSampleRateToken.GetString(), pd->animationSampleRate, DEBUG_TAG);
     argReadString(
       args, animationPositionToleranceToken.GetString(), pd->animationPositionTolerance, DEBUG_TAG);
     argReadString(
@@ -103,6 +105,7 @@ UsdFbxFileFormat::ComposeFieldsForFileFormatArguments(const std::string& assetPa
 {
     argComposeBool(context, args, animationStacksToken, DEBUG_TAG);
     argComposeString(context, args, animationModeToken, DEBUG_TAG);
+    argComposeString(context, args, animationSampleRateToken, DEBUG_TAG);
     argComposeString(context, args, animationPositionToleranceToken, DEBUG_TAG);
     argComposeString(context, args, animationRotationToleranceToken, DEBUG_TAG);
     argComposeString(context, args, animationScaleToleranceToken, DEBUG_TAG);
@@ -143,9 +146,12 @@ UsdFbxFileFormat::Read(SdfLayer* layer, const std::string& resolvedPath, bool me
     ImportFbxOptions options;
     if (data->animationMode == "keyframes") {
         options.animationMode = FBXAnimationMode::Keyframes;
+    } else if (data->animationMode == "resample") {
+        options.animationMode = FBXAnimationMode::Resample;
     } else if (data->animationMode != "adaptive") {
-        TF_RUNTIME_ERROR("Invalid animationMode '%s'; expected 'keyframes' or 'adaptive'.",
-                         data->animationMode.c_str());
+        TF_RUNTIME_ERROR(
+          "Invalid animationMode '%s'; expected 'keyframes', 'adaptive' or 'resample'.",
+          data->animationMode.c_str());
         return false;
     }
     auto read_number =
@@ -163,7 +169,9 @@ UsdFbxFileFormat::Read(SdfLayer* layer, const std::string& resolvedPath, bool me
                            allowZero ? "non-negative" : "positive");
           return false;
       };
-    if (!read_number(data->animationPositionTolerance,
+    if (!read_number(
+          data->animationSampleRate, "animationSampleRate", options.animationSampleRate, true) ||
+        !read_number(data->animationPositionTolerance,
                      "animationPositionTolerance",
                      options.animationPositionTolerance) ||
         !read_number(data->animationRotationTolerance,

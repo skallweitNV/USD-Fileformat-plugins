@@ -20,6 +20,7 @@ enum class FBXAnimationMode
 {
     Keyframes,
     Adaptive,
+    Resample,
 };
 
 struct ImportFbxOptions
@@ -32,7 +33,8 @@ struct ImportFbxOptions
     bool importAnimationStacks = false;
     bool triangulateMeshes = true;
     FBXAnimationMode animationMode = FBXAnimationMode::Adaptive;
-    // Refinement and reduction each use half of these error budgets.
+    double animationSampleRate = 0.0; // Resample mode only; zero uses the scene FPS.
+    // Adaptive refinement/reduction each use half; resample reduction uses all.
     double animationPositionTolerance = 0.0001; // Meters, accounting for parent scale.
     double animationRotationTolerance = 0.01;   // Degrees.
     double animationScaleTolerance = 0.00001;   // Relative, with a unit floor.

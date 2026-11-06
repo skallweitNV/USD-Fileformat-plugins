@@ -24,25 +24,31 @@
                     "animationMode": {
                         "appliesTo": [ "prims" ],
                         "displayGroup": "Core",
-                        "documentation": "Node transform sampling: keyframes or adaptive (default). Skeletal sampling is unchanged.",
+                        "documentation": "Node transform sampling: keyframes, adaptive (default), or resample at animationSampleRate (scene FPS by default) then reduce. Skeletal sampling is unchanged.",
                         "type": "string"
                     },
                     "animationPositionTolerance": {
                         "appliesTo": [ "prims" ],
                         "displayGroup": "Core",
-                        "documentation": "Adaptive translation tolerance in meters, accounting for parent scale (default 0.0001).",
+                        "documentation": "Adaptive/resample translation tolerance in meters, accounting for parent scale (default 0.0001).",
+                        "type": "string"
+                    },
+                    "animationSampleRate": {
+                        "appliesTo": [ "prims" ],
+                        "displayGroup": "Core",
+                        "documentation": "Target sample rate in Hz for resample mode (default 0 uses scene FPS). Does not change playback FPS or clip duration; endpoints are retained.",
                         "type": "string"
                     },
                     "animationRotationTolerance": {
                         "appliesTo": [ "prims" ],
                         "displayGroup": "Core",
-                        "documentation": "Adaptive local rotation tolerance in degrees (default 0.01, less than 180).",
+                        "documentation": "Adaptive/resample local rotation tolerance in degrees (default 0.01, less than 180).",
                         "type": "string"
                     },
                     "animationScaleTolerance": {
                         "appliesTo": [ "prims" ],
                         "displayGroup": "Core",
-                        "documentation": "Adaptive relative local scale tolerance with a unit floor (default 0.00001).",
+                        "documentation": "Adaptive/resample relative local scale tolerance with a unit floor (default 0.00001).",
                         "type": "string"
                     },
                     "animationMaxSampleRate": {

@@ -162,7 +162,7 @@ Note that PBR materials are not supported on export, only Phong
 
 * `animationMode`: Sampling policy for node transforms, including cameras. Default is `"adaptive"`.
 
-    The accepted values are exactly `"keyframes"` and `"adaptive"` (case-sensitive).
+    The accepted values are exactly `"keyframes"`, `"adaptive"` and `"resample"` (case-sensitive).
     Unknown or empty values fail import with a diagnostic listing the supported modes.
 
     `keyframes` evaluates the FBX SDK transform at the union of original key times
@@ -176,7 +176,19 @@ Note that PBR materials are not supported on export, only Phong
     It reduces translation, rotation and scale independently and approximates motion using
     ordinary USD time samples; it does not author source curve tangents or splines.
 
-    Both modes retain source-frame time codes and the same transform decomposition.
+    `resample` evaluates transforms on a uniform grid between each node's first
+    and last source keys, including both endpoints even if off-grid. It discards
+    other source key times and adds no adaptive or one-sided samples. It then
+    reduces each TRS channel against the baked samples using the full error budget.
+    Thus each channel contains at most the grid samples plus its endpoints.
+    Held curves match the evaluated values at frame times, but transitions
+    interpolate between adjacent frames. Subframe motion, including motion blur,
+    can differ from the source. The grid uses the scene FPS by default, or an
+    explicit positive `animationSampleRate` in Hz. Changing the sample rate does
+    not change USD playback FPS or clip duration. `animationMaxSampleRate` does
+    not affect this mode.
+
+    All modes retain source-frame time codes and the same transform decomposition.
     Constant channels may be reduced to their endpoints. Skeletal animation sampling
     is unchanged. This option does not control animated camera lens properties or
     other non-transform attributes.
@@ -188,23 +200,26 @@ Note that PBR materials are not supported on export, only Phong
     stage.Export("scene.usdc")
     ```
 
-    Arguments are part of the USD layer identifier, so both modes can coexist for
+    Arguments are part of the USD layer identifier, so all modes can coexist for
     the same FBX. `animationMode` can also be authored as prim metadata for a dynamic
     FBX payload; changing it recomposes the payload. Once exported to USD, changing
     this option does not alter the exported samples: reopen the FBX with the desired mode.
 
-Adaptive mode accepts these finite file-format arguments (also available
+Adaptive and resample modes accept these finite file-format arguments (also available
 as string metadata on dynamic payloads):
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
+| `animationSampleRate` | `0` | Target grid rate in Hz for resample mode; zero uses the scene FPS. Ignored by other modes |
 | `animationPositionTolerance` | `0.0001` | Translation error in meters, accounting for parent scale and float precision |
 | `animationRotationTolerance` | `0.01` | Local rotation error in degrees; must be less than 180 |
 | `animationScaleTolerance` | `0.00001` | Relative local scale error, with a unit floor |
 | `animationMaxSampleRate` | `0` | Optional maximum frequency of additional adaptive subdivisions, in Hz; zero disables the rate cap |
 
-Tolerances must be positive; the rate must be non-negative. Refinement and channel
-reduction each use half the error budget. Translation,
+Tolerances must be positive; both rates must be non-negative. Refinement and channel
+reduction each use half the error budget in adaptive mode. Resample mode uses the
+full budget for reduction against baked frame samples only, without bounding
+error between frames. Translation,
 rotation and scale are reduced independently; nearly constant channels collapse
 to their evaluated value and retain clip endpoints. Source keys and one-sided
 samples around held transitions are not discarded by the frequency limit; the

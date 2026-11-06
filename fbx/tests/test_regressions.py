@@ -172,6 +172,11 @@ def test_animation_modes_coexist() -> None:
     default = open_fbx(source)
     adaptive = open_fbx(source, "adaptive")
     keyframes = open_fbx(source, "keyframes")
+    resampled = open_fbx(source, "resample")
+    assert (
+        len({s.GetRootLayer().identifier for s in (adaptive, keyframes, resampled)})
+        == 3
+    )
     assert adaptive.GetRootLayer().identifier != keyframes.GetRootLayer().identifier
     assert (
         default.GetRootLayer().ExportToString()
@@ -197,7 +202,7 @@ def test_animation_modes_coexist() -> None:
             dense.ComputeLocalToWorldTransform(time),
             atol=1e-6,
         )
-    for stage in (keyframes, adaptive):
+    for stage in (keyframes, adaptive, resampled):
         assert stage.GetTimeCodesPerSecond() == stage.GetFramesPerSecond() == 24
         assert stage.GetEndTimeCode() == 48
 
@@ -251,6 +256,161 @@ def test_animation_mode_payload_recomposition() -> None:
     assert dense.ComputeLocalToWorldTransform(12).ExtractTranslation()[
         0
     ] == pytest.approx(1.5625, abs=5e-4)
+    prim.SetMetadata("animationMode", "resample")
+    baked = UsdGeom.Xformable(stage.GetPrimAtPath(path))
+    assert 2 < len(baked.GetTimeSamples()) <= 49
+    assert baked.ComputeLocalToWorldTransform(12).ExtractTranslation()[
+        0
+    ] == pytest.approx(1.5625, abs=1e-4)
+
+
+@pytest.mark.parametrize("fps", [24.0, 30.0, 29.97])
+def test_resample_frame_grid_and_motion(tmp_path: Path, fps: float) -> None:
+    text = (DATA / "cubic_camera_pivot.fbx").read_text()
+    text = text.replace(
+        '"TimeMode", "enum", "", "",11', '"TimeMode", "enum", "", "",14'
+    )
+    text = text.replace(
+        '"CustomFrameRate", "double", "Number", "",-1',
+        f'"CustomFrameRate", "double", "Number", "",{fps}',
+    )
+    source = tmp_path / "custom_fps.fbx"
+    source.write_text(text)
+    stage = open_fbx(source, "resample")
+    assert stage.GetTimeCodesPerSecond() == pytest.approx(fps)
+    assert stage.GetEndTimeCode() == pytest.approx(2 * fps)
+    for prim in stage.Traverse():
+        for attr in prim.GetAttributes():
+            if not attr.GetName().startswith("xformOp:"):
+                continue
+            times = attr.GetTimeSamples()
+            assert len(times) <= int(np.ceil(2 * fps)) + 1
+            for time in times:
+                assert min(abs(time - round(time)), abs(time - 2 * fps)) < 1e-5
+    for name in ("CubicCamera", "OrbitingTriangle", "Held", "HeldNext"):
+        prim = next(p for p in stage.Traverse() if p.GetName() == name)
+        transform = UsdGeom.Xformable(prim)
+        # Evaluate at the stored float time codes, avoiding selecting the wrong
+        # side of a held transition due to seconds-to-frame float rounding.
+        for frame in range(int(2 * fps) + 1):
+            seconds = frame / fps
+            time = float(np.float32(np.float32(seconds) * fps))
+            if name == "CubicCamera":
+                t = seconds / 2
+                expected = (10 * (3 * t * t - 2 * t * t * t), 0, 0)
+            elif name == "OrbitingTriangle":
+                angle = 2 * np.pi * seconds
+                expected = (4 + 2 * np.cos(angle), 2 * np.sin(angle), 0)
+            elif name == "Held":
+                expected = (10 * int(seconds), 0, 0)
+            else:
+                expected = (10 * int(np.ceil(seconds)), 0, 0)
+            np.testing.assert_allclose(
+                transform.ComputeLocalToWorldTransform(time).ExtractTranslation(),
+                expected,
+                atol=2e-4,
+                rtol=0,
+            )
+
+
+def test_resample_discards_subframe_source_keys(tmp_path: Path) -> None:
+    text = (DATA / "cubic_camera_pivot.fbx").read_text()
+    # The held channels have an interior source key at frame 24.25.
+    text = text.replace("a: 0,46186158000,92372316000", "a: 0,46667263812,92372316000")
+    source = tmp_path / "subframe.fbx"
+    source.write_text(text)
+    stage = open_fbx(source, "resample")
+    for name in ("Held", "HeldNext"):
+        prim = next(p for p in stage.Traverse() if p.GetName() == name)
+        times = UsdGeom.Xformable(prim).GetTimeSamples()
+        assert times
+        assert all(abs(time - round(time)) < 1e-5 for time in times)
+        assert len(times) <= 49
+
+
+@pytest.mark.parametrize("rate", [12.0, 60.0, 29.97, 0.7])
+def test_explicit_resample_rate_preserves_playback(rate: float) -> None:
+    stage = open_fbx(
+        DATA / "cubic_camera_pivot.fbx", "resample", animationSampleRate=str(rate)
+    )
+    assert stage.GetTimeCodesPerSecond() == stage.GetFramesPerSecond() == 24
+    assert stage.GetEndTimeCode() == 48
+    for prim in stage.Traverse():
+        for attr in prim.GetAttributes():
+            if attr.GetName().startswith("xformOp:"):
+                times = attr.GetTimeSamples()
+                assert len(times) <= int(np.ceil(2 * rate)) + 1
+                for time in times:
+                    sample = time / 24 * rate
+                    assert min(abs(sample - round(sample)), abs(time - 48)) < 1e-5
+    camera = next(p for p in stage.Traverse() if p.GetName() == "CubicCamera")
+    transform = UsdGeom.Xformable(camera)
+    for sample in range(int(2 * rate) + 1):
+        seconds = sample / rate
+        time = float(np.float32(np.float32(seconds) * 24))
+        t = seconds / 2
+        assert transform.ComputeLocalToWorldTransform(time).ExtractTranslation()[
+            0
+        ] == pytest.approx(10 * (3 * t * t - 2 * t * t * t), abs=1e-4)
+
+
+def test_resample_rate_payload_recomposition() -> None:
+    source = open_fbx(DATA / "cubic_camera_pivot.fbx", "resample")
+    stage = Usd.Stage.CreateInMemory()
+    root = stage.DefinePrim("/Asset")
+    root.SetMetadata("animationMode", "resample")
+    root.SetMetadata("animationSampleRate", "12")
+    root.GetPayloads().AddPayload(
+        str(DATA / "cubic_camera_pivot.fbx"), source.GetDefaultPrim().GetPath()
+    )
+    path = next(p.GetPath() for p in stage.Traverse() if p.GetName() == "CubicCamera")
+    assert len(UsdGeom.Xformable(stage.GetPrimAtPath(path)).GetTimeSamples()) <= 25
+    root.SetMetadata("animationSampleRate", "60")
+    assert len(UsdGeom.Xformable(stage.GetPrimAtPath(path)).GetTimeSamples()) > 25
+
+
+@pytest.mark.parametrize("value", ["invalid", "-1", "nan", "inf", "1junk"])
+def test_invalid_resample_rate(value: str) -> None:
+    with pytest.raises(Tf.ErrorException, match="animationSampleRate"):
+        open_fbx(DATA / "cubic_camera_pivot.fbx", "resample", animationSampleRate=value)
+
+
+def test_resample_preserves_off_grid_endpoints(tmp_path: Path) -> None:
+    text = (DATA / "cubic_camera_pivot.fbx").read_text()
+    text = text.replace("a: 0,92372316000", "a: 481105812,91891210187")
+    source = tmp_path / "endpoints.fbx"
+    source.write_text(text)
+    stage = open_fbx(source, "resample")
+    camera = next(p for p in stage.Traverse() if p.GetName() == "CubicCamera")
+    times = UsdGeom.Xformable(camera).GetTimeSamples()
+    assert times[0] == pytest.approx(0.25, abs=1e-5)
+    assert times[-1] == pytest.approx(47.75, abs=1e-5)
+    assert all(abs(time - round(time)) < 1e-5 for time in times[1:-1])
+
+
+def test_resample_reduces_linear_motion_and_ignores_adaptive_cap(
+    tmp_path: Path,
+) -> None:
+    text = (
+        (DATA / "cubic_camera_pivot.fbx")
+        .read_text()
+        .replace("a: 1032,1032", "a: 8452,8452")
+    )
+    source = tmp_path / "linear.fbx"
+    source.write_text(text)
+    stages = [
+        open_fbx(source, "resample", animationMaxSampleRate=rate) for rate in ("0", "1")
+    ]
+    assert (
+        stages[0].GetRootLayer().ExportToString()
+        == stages[1].GetRootLayer().ExportToString()
+    )
+    camera = next(p for p in stages[0].Traverse() if p.GetName() == "CubicCamera")
+    assert camera.GetAttribute("xformOp:translate").GetTimeSamples() == [0, 48]
+    assert all(
+        op.GetNumTimeSamples() <= 2
+        for op in UsdGeom.Xformable(camera).GetOrderedXformOps()
+    )
 
 
 def test_reduces_channels_independently() -> None:
