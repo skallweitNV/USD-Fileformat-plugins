@@ -18,7 +18,9 @@ from pxr import Ar, Sdf, Tf, Usd, UsdGeom, UsdShade
 DATA = Path(__file__).parent / "data"
 
 
-def open_fbx(path: Path, animation_mode: str | None = None) -> Usd.Stage:
+def open_fbx(
+    path: Path, animation_mode: str | None = None, **arguments: str
+) -> Usd.Stage:
     assert Sdf.FileFormat.FindByExtension(
         "fbx"
     ), "Register the usdFbx plugin before running tests"
@@ -29,7 +31,8 @@ def open_fbx(path: Path, animation_mode: str | None = None) -> Usd.Stage:
     }
     if animation_mode is not None:
         args["animationMode"] = animation_mode
-    layer = Sdf.Layer.FindOrOpen(str(path), args)
+    args.update(arguments)
+    layer = Sdf.Layer.FindOrOpen(str(path.resolve()), args)
     assert layer
     stage = Usd.Stage.Open(layer)
     assert stage
@@ -248,3 +251,203 @@ def test_animation_mode_payload_recomposition() -> None:
     assert dense.ComputeLocalToWorldTransform(12).ExtractTranslation()[
         0
     ] == pytest.approx(1.5625, abs=5e-4)
+
+
+def test_reduces_channels_independently() -> None:
+    source = DATA / "cubic_camera_pivot.fbx"
+    stage = open_fbx(source, animationMaxSampleRate="960")
+    pivot = next(p for p in stage.Traverse() if p.GetName() == "Pivot")
+    counts = {
+        op.GetOpType(): op.GetNumTimeSamples()
+        for op in UsdGeom.Xformable(pivot).GetOrderedXformOps()
+    }
+    assert counts[UsdGeom.XformOp.TypeOrient] < 30
+    assert counts[UsdGeom.XformOp.TypeTranslate] > counts[UsdGeom.XformOp.TypeOrient]
+    assert counts.get(UsdGeom.XformOp.TypeScale, 0) <= 2
+    # Full revolutions must remain visible between equal endpoints.
+    transform = UsdGeom.Xformable(pivot)
+    for seconds in np.linspace(0, 2, 257):
+        matrix = transform.GetLocalTransformation(float(seconds * 24))
+        angle = 2 * np.pi * seconds
+        np.testing.assert_allclose(
+            matrix.ExtractTranslation(),
+            (4 - 4 * np.cos(angle), -4 * np.sin(angle), 0),
+            atol=1e-4,
+            rtol=0,
+        )
+
+
+def test_small_rotation_preserves_both_interpolations(tmp_path: Path) -> None:
+    source = DATA / "cubic_camera_pivot.fbx"
+    text = source.read_text().replace("a: 0,720\n", "a: -1,2\n")
+    text = text.replace("a: 8452,8452\n", "a: 1032,1032\n")
+    text = text.replace(
+        '"RotationPivot", "Vector3D", "Vector", "",4,0,0',
+        '"RotationPivot", "Vector3D", "Vector", "",0,0,0',
+    )
+    source = tmp_path / "small_rotation.fbx"
+    source.write_text(text)
+    stage = open_fbx(source)
+    pivot = next(p for p in stage.Traverse() if p.GetName() == "Pivot")
+    orientation = pivot.GetAttribute("xformOp:orient")
+    transform = UsdGeom.Xformable(pivot)
+    for seconds in np.linspace(0, 2, 257):
+        t = seconds / 2
+        expected = -1 + 3 * (3 * t * t - 2 * t * t * t)
+        time = float(seconds * 24)
+        quat = orientation.Get(time).GetNormalized()
+        normalized_angle = np.degrees(
+            2 * np.arctan2(quat.GetImaginary()[2], quat.GetReal())
+        )
+        matrix = transform.GetLocalTransformation(time)
+        usd_angle = np.degrees(np.arctan2(matrix[0][1], matrix[0][0]))
+        assert normalized_angle == pytest.approx(expected, abs=0.01)
+        assert usd_angle == pytest.approx(expected, abs=0.01)
+
+
+def test_collapses_translation_noise(tmp_path: Path) -> None:
+    source = DATA / "cubic_camera_pivot.fbx"
+    text = source.read_text()
+    assert "a: 0,10\n" in text
+    source = tmp_path / "noise.fbx"
+    source.write_text(text.replace("a: 0,10\n", "a: 0,0.00000001\n"))
+    stage = open_fbx(source)
+    camera = next(p for p in stage.Traverse() if p.GetName() == "CubicCamera")
+    op = next(
+        op
+        for op in UsdGeom.Xformable(camera).GetOrderedXformOps()
+        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate
+    )
+    assert op.GetNumTimeSamples() <= 2
+    values = [op.Get(t) for t in op.GetTimeSamples()]
+    assert all(value == values[0] for value in values)
+    assert (stage.GetStartTimeCode(), stage.GetEndTimeCode()) == (0, 48)
+
+
+@pytest.mark.parametrize("scale", ["0.01,0.01,0.01", "0.01,0.03,0.02"])
+def test_translation_tolerance_accounts_for_parent_scale(
+    tmp_path: Path, scale: str
+) -> None:
+    source = DATA / "cubic_camera_pivot.fbx"
+    unscaled = open_fbx(source)
+    camera = next(p for p in unscaled.Traverse() if p.GetName() == "CubicCamera")
+    original_count = len(UsdGeom.Xformable(camera).GetTimeSamples())
+    text = source.read_text()
+    parent = f"""\n\tModel: 1000, "Model::ScaledParent", "Null" {{
+        Version: 232
+        Properties70: {{
+            P: "Lcl Scaling", "Lcl Scaling", "", "A",{scale}
+        }}
+    }}\n"""
+    text = text.replace("Objects:  {", "Objects:  {" + parent)
+    text = text.replace('C: "OO",2261461967184,0', 'C: "OO",2261461967184,1000')
+    text = text.replace("Connections:  {", 'Connections:  {\n\tC: "OO",1000,0')
+    source = tmp_path / "scaled.fbx"
+    source.write_text(text)
+    scaled = open_fbx(source)
+    camera = UsdGeom.Xformable(
+        next(p for p in scaled.Traverse() if p.GetName() == "CubicCamera")
+    )
+    assert 2 < len(camera.GetTimeSamples()) < original_count
+    for seconds in np.linspace(0, 2, 257):
+        t = seconds / 2
+        expected = (0.1 * (3 * t * t - 2 * t * t * t), 0, 0)
+        np.testing.assert_allclose(
+            camera.ComputeLocalToWorldTransform(
+                float(seconds * 24)
+            ).ExtractTranslation(),
+            expected,
+            atol=1e-4,
+            rtol=0,
+        )
+
+
+def test_sampling_options_control_density(capfd: pytest.CaptureFixture[str]) -> None:
+    source = DATA / "cubic_camera_pivot.fbx"
+    stages = [
+        open_fbx(source, animationPositionTolerance=tolerance)
+        for tolerance in ("0.0001", "0.01")
+    ]
+    counts = []
+    for stage in stages:
+        camera = next(p for p in stage.Traverse() if p.GetName() == "CubicCamera")
+        counts.append(
+            sum(
+                op.GetNumTimeSamples()
+                for op in UsdGeom.Xformable(camera).GetOrderedXformOps()
+            )
+        )
+    assert counts[0] > counts[1]
+    limited = open_fbx(source, animationMaxSampleRate="0.5")
+    assert "maximum rate 0.5 Hz" in capfd.readouterr().err
+    camera = next(p for p in limited.Traverse() if p.GetName() == "CubicCamera")
+    assert (
+        max(
+            op.GetNumTimeSamples()
+            for op in UsdGeom.Xformable(camera).GetOrderedXformOps()
+        )
+        <= 49
+    )
+    held = UsdGeom.Xformable(
+        next(p for p in limited.Traverse() if p.GetName() == "Held")
+    )
+    for seconds, expected in ((0.999, 0), (1, 10), (1.001, 10), (2, 20)):
+        assert held.GetLocalTransformation(seconds * 24).ExtractTranslation()[
+            0
+        ] == pytest.approx(expected)
+
+
+def test_sampling_metadata_recomposes_payload() -> None:
+    source = DATA / "cubic_camera_pivot.fbx"
+    imported = open_fbx(source)
+    stage = Usd.Stage.CreateInMemory()
+    asset = stage.DefinePrim("/Asset")
+    asset.SetMetadata("animationPositionTolerance", "0.01")
+    asset.GetPayloads().AddPayload(
+        str(source.resolve()), imported.GetDefaultPrim().GetPath()
+    )
+    camera = next(p for p in stage.Traverse() if p.GetName() == "CubicCamera")
+    path = camera.GetPath()
+    loose_count = len(UsdGeom.Xformable(camera).GetTimeSamples())
+    asset.SetMetadata("animationPositionTolerance", "0.0001")
+    assert (
+        len(UsdGeom.Xformable(stage.GetPrimAtPath(path)).GetTimeSamples()) > loose_count
+    )
+    asset.SetMetadata("animationMode", "keyframes")
+    assert UsdGeom.Xformable(stage.GetPrimAtPath(path)).GetTimeSamples() == [0, 48]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "animationPositionTolerance",
+        "animationRotationTolerance",
+        "animationScaleTolerance",
+        "animationMaxSampleRate",
+    ],
+)
+@pytest.mark.parametrize("value", ["invalid", "-1", "nan", "inf", "1junk"])
+def test_rejects_invalid_sampling_options(name: str, value: str) -> None:
+    source = DATA / "cubic_camera_pivot.fbx"
+    with pytest.raises(Tf.ErrorException, match=name):
+        open_fbx(source, **{name: value})
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "animationPositionTolerance",
+        "animationRotationTolerance",
+        "animationScaleTolerance",
+    ],
+)
+def test_rejects_zero_tolerance(name: str) -> None:
+    source = DATA / "cubic_camera_pivot.fbx"
+    with pytest.raises(Tf.ErrorException, match=name):
+        open_fbx(source, **{name: "0"})
+
+
+@pytest.mark.parametrize("value", ["180", "181"])
+def test_rejects_ambiguous_rotation_tolerance(value: str) -> None:
+    with pytest.raises(Tf.ErrorException, match="animationRotationTolerance"):
+        open_fbx(DATA / "cubic_camera_pivot.fbx", animationRotationTolerance=value)

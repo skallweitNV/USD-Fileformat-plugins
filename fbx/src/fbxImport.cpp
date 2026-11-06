@@ -314,9 +314,28 @@ importFbxTransform(ImportFbxContext& ctx,
                 GfVec3f scale;
             };
             std::map<FbxTime, TransformSample> samples;
+            double parentStretch = useGlobalTransform || !fbxNode->GetParent() ? 1 : 0;
             auto evaluate = [&](FbxTime time) -> const TransformSample& {
                 auto [it, inserted] = samples.try_emplace(time);
                 if (inserted) {
+                    if (!useGlobalTransform && fbxNode->GetParent()) {
+                        const auto parent = fbxNode->GetParent()->EvaluateGlobalTransform(time);
+                        // sqrt(||M||_1 * ||M||_inf) bounds the largest stretch,
+                        // including nonuniform scale and shear. Track the maximum
+                        // over evaluated times so reduction uses a conservative
+                        // physical-space translation budget for the whole track.
+                        double rowNorm = 0, columnNorm = 0;
+                        for (int i = 0; i < 3; ++i) {
+                            double row = 0, column = 0;
+                            for (int j = 0; j < 3; ++j) {
+                                row += std::abs(parent.Get(i, j));
+                                column += std::abs(parent.Get(j, i));
+                            }
+                            rowNorm = std::max(rowNorm, row);
+                            columnNorm = std::max(columnNorm, column);
+                        }
+                        parentStretch = std::max(parentStretch, std::sqrt(rowNorm * columnNorm));
+                    }
                     auto& value = it->second;
                     decomposeTransformation(value.translation,
                                             value.rotation,
@@ -332,6 +351,63 @@ importFbxTransform(ImportFbxContext& ctx,
                 }
                 return it->second;
             };
+            // Reserve half the requested error for evaluation and half for reduction.
+            const double rotationChordTolerance =
+              2 * std::sin(ctx.options->animationRotationTolerance * 3.14159265358979323846 / 1440);
+            auto translationError =
+              [&](const GfVec3f& a, const GfVec3f& b, const GfVec3f& actual, double alpha) {
+                  const GfVec3d expected = (1 - alpha) * GfVec3d(a) + alpha * GfVec3d(b);
+                  const double rounding =
+                    4 * std::numeric_limits<float>::epsilon() * std::max(expected.GetLength(), 1.0);
+                  const double positionTolerance =
+                    0.5 * ctx.options->animationPositionTolerance /
+                    std::max(ctx.usd->metersPerUnit * parentStretch, 1e-12);
+                  return (expected - GfVec3d(actual)).GetLength() /
+                         std::max(positionTolerance, rounding);
+              };
+            auto scaleError =
+              [&](const GfVec3f& a, const GfVec3f& b, const GfVec3f& actual, double alpha) {
+                  const GfVec3d expected = (1 - alpha) * GfVec3d(a) + alpha * GfVec3d(b);
+                  return (expected - GfVec3d(actual)).GetLength() /
+                         (0.5 * ctx.options->animationScaleTolerance *
+                          std::max(expected.GetLength(), 1.0));
+              };
+            auto rotationError =
+              [&](const GfQuatf& a, const GfQuatf& b, const GfQuatf& actual, double alpha) {
+                  // USD converts its unnormalized close-angle lerp through
+                  // axis-angle, while direct-channel consumers use unit slerp.
+                  // Bound both interpretations, especially near zero rotation.
+                  const GfQuatd left = GfQuatd(a).GetNormalized();
+                  GfQuatd right = GfQuatd(b).GetNormalized();
+                  double dot = left.GetReal() * right.GetReal() +
+                               GfDot(left.GetImaginary(), right.GetImaginary());
+                  if (dot < 0) {
+                      right = -right;
+                      dot = -dot;
+                  }
+                  const GfQuatd interpolated = GfSlerp(alpha, left, right);
+                  GfQuatd spherical = interpolated.GetNormalized();
+                  if (dot < 1 - 1e-12) {
+                      const double angle = std::acos(std::clamp(dot, 0.0, 1.0));
+                      spherical =
+                        (std::sin((1 - alpha) * angle) * left + std::sin(alpha * angle) * right) /
+                        std::sin(angle);
+                  }
+                  const GfQuatd target = GfQuatd(actual).GetNormalized();
+                  auto distance = [&](GfQuatd expected) {
+                      if (expected.GetReal() * target.GetReal() +
+                            GfDot(expected.GetImaginary(), target.GetImaginary()) <
+                          0)
+                          expected = -expected;
+                      const double real = expected.GetReal() - target.GetReal();
+                      return std::sqrt(
+                        real * real +
+                        (expected.GetImaginary() - target.GetImaginary()).GetLengthSq());
+                  };
+                  return std::max(distance(GfRotation(interpolated).GetQuat()),
+                                  distance(spherical)) /
+                         rotationChordTolerance;
+              };
             if (adaptive && keyFrameTimes.size() > 1) {
                 double fps = FbxTime::GetFrameRate(ctx.scene->GetGlobalSettings().GetTimeMode());
                 if (fps <= 0)
@@ -346,51 +422,37 @@ importFbxTransform(ImportFbxContext& ctx,
                     time.SetSecondDouble(frame / rate);
                     keyFrameTimes.insert(time);
                 }
-                const double positionTolerance = 1e-4 / std::max(ctx.usd->metersPerUnit, 1e-12);
-                auto differs = [&](const TransformSample& a,
-                                   const TransformSample& b,
-                                   const TransformSample& actual,
-                                   double alpha) {
-                    const GfVec3d translation =
-                      (1 - alpha) * GfVec3d(a.translation) + alpha * GfVec3d(b.translation);
-                    const double rounding = 4 * std::numeric_limits<float>::epsilon() *
-                                            std::max(translation.GetLength(), 1.0);
-                    if ((translation - GfVec3d(actual.translation)).GetLength() >
-                        std::max(positionTolerance, rounding))
-                        return true;
-                    const GfVec3d scale = (1 - alpha) * GfVec3d(a.scale) + alpha * GfVec3d(b.scale);
-                    if ((scale - GfVec3d(actual.scale)).GetLength() >
-                        1e-6 * std::max(scale.GetLength(), 1.0))
-                        return true;
-                    // Match USD's orient evaluation, including its close-angle
-                    // linear quaternion interpolation and axis-angle conversion.
-                    GfQuatd rotation = GfRotation(GfSlerp(alpha,
-                                                          GfQuatd(a.rotation).GetNormalized(),
-                                                          GfQuatd(b.rotation).GetNormalized()))
-                                         .GetQuat();
-                    const GfQuatd target = GfQuatd(actual.rotation).GetNormalized();
-                    const double dot = rotation.GetReal() * target.GetReal() +
-                                       GfDot(rotation.GetImaginary(), target.GetImaginary());
-                    if (dot < 0)
-                        rotation = -rotation;
-                    const double real = rotation.GetReal() - target.GetReal();
-                    const GfVec3d imaginary =
-                      GfVec3d(rotation.GetImaginary()) - target.GetImaginary();
-                    return real * real + imaginary.GetLengthSq() > 4e-12;
-                };
+                size_t limitedIntervals = 0;
+                double largestLimitedError = 0;
                 std::function<void(FbxTime, FbxTime, int)> refine;
                 refine = [&](FbxTime first, FbxTime last, int depth) {
                     const double a = first.GetSecondDouble(), b = last.GetSecondDouble();
-                    if (depth == 12 || std::nextafter(float(a), INFINITY) >= float(b))
+                    if (last.Get() - first.Get() <= 1 ||
+                        std::nextafter(float(a), INFINITY) >= float(b))
                         return;
                     const auto& left = evaluate(first);
                     const auto& right = evaluate(last);
-                    bool split = false;
+                    double error = 0;
                     for (double fraction : { 0.25, 0.5, 0.75 }) {
                         FbxTime time;
                         time.SetSecondDouble(a + fraction * (b - a));
-                        split |= differs(left, right, evaluate(time), fraction);
+                        const auto& actual = evaluate(time);
+                        error = std::max(
+                          { error,
+                            translationError(
+                              left.translation, right.translation, actual.translation, fraction),
+                            rotationError(left.rotation, right.rotation, actual.rotation, fraction),
+                            scaleError(left.scale, right.scale, actual.scale, fraction) });
                     }
+                    const bool rateLimited = ctx.options->animationMaxSampleRate > 0 &&
+                                             (b - a) * 0.5 + 1.0 / FBXSDK_TC_SECOND <
+                                               1 / ctx.options->animationMaxSampleRate;
+                    if (error > 1 && (depth == 12 || rateLimited)) {
+                        ++limitedIntervals;
+                        largestLimitedError = std::max(largestLimitedError, error);
+                        return;
+                    }
+                    const bool split = error > 1;
                     if (split) {
                         FbxTime middle;
                         middle.SetSecondDouble((a + b) * 0.5);
@@ -402,6 +464,14 @@ importFbxTransform(ImportFbxContext& ctx,
                 const std::vector<FbxTime> baseTimes(keyFrameTimes.begin(), keyFrameTimes.end());
                 for (size_t i = 1; i < baseTimes.size(); ++i)
                     refine(baseTimes[i - 1], baseTimes[i], 0);
+                if (limitedIntervals)
+                    TF_WARN("Animation sampling for %s reached a refinement limit in %zu intervals "
+                            "(maximum rate %.1f Hz; 0 disables rate cap); "
+                            "largest error was %.3g times the refinement budget",
+                            fbxNode->GetName(),
+                            limitedIntervals,
+                            ctx.options->animationMaxSampleRate,
+                            largestLimitedError);
             }
 
             size_t numKeyFrames = keyFrameTimes.size();
@@ -444,20 +514,74 @@ importFbxTransform(ImportFbxContext& ctx,
                 nodeAnimation.scales.times.push_back(time);
                 nodeAnimation.scales.values.push_back(scale);
             }
-            // Constant channels need only their endpoints. Keep their sampled
-            // value, which may differ from the unanimated default transform.
-            auto compactConstant = [](auto& channel) {
-                if (channel.times.size() > 2 &&
-                    std::all_of(channel.values.begin(), channel.values.end(), [&](const auto& v) {
-                        return v == channel.values.front();
+            // Reduce each channel independently against its own interpolation.
+            // Endpoints retain the clip duration; near-constant channels retain
+            // their evaluated value, which can differ from the static default.
+            auto reduce = [&](auto& channel, const auto& error) {
+                const size_t count = channel.times.size();
+                if (count < 2)
+                    return;
+                const auto firstValue = channel.values.front();
+                if (std::all_of(channel.values.begin(), channel.values.end(), [&](const auto& v) {
+                        return error(firstValue, firstValue, v, 0) <= 1;
                     })) {
                     channel.times = { channel.times.front(), channel.times.back() };
-                    channel.values = { channel.values.front(), channel.values.back() };
+                    channel.values = { firstValue, firstValue };
+                    return;
                 }
+                std::vector<bool> keep(count, false);
+                keep.front() = keep.back() = true;
+                std::vector<std::pair<size_t, size_t>> pending = { { 0, count - 1 } };
+                while (!pending.empty()) {
+                    const auto [first, last] = pending.back();
+                    pending.pop_back();
+                    double worst = 1;
+                    size_t split = first;
+                    for (size_t i = first + 1; i < last; ++i) {
+                        const double alpha = (double(channel.times[i]) - channel.times[first]) /
+                                             (double(channel.times[last]) - channel.times[first]);
+                        const double deviation = error(
+                          channel.values[first], channel.values[last], channel.values[i], alpha);
+                        if (deviation > worst) {
+                            worst = deviation;
+                            split = i;
+                        }
+                    }
+                    if (split != first) {
+                        keep[split] = true;
+                        pending.emplace_back(first, split);
+                        pending.emplace_back(split, last);
+                    }
+                }
+                size_t output = 0;
+                for (size_t i = 0; i < count; ++i) {
+                    if (keep[i]) {
+                        channel.times[output] = channel.times[i];
+                        channel.values[output++] = channel.values[i];
+                    }
+                }
+                channel.times.resize(output);
+                channel.values.resize(output);
             };
-            compactConstant(nodeAnimation.translations);
-            compactConstant(nodeAnimation.rotations);
-            compactConstant(nodeAnimation.scales);
+            if (adaptive) {
+                reduce(nodeAnimation.translations, translationError);
+                reduce(nodeAnimation.rotations, rotationError);
+                reduce(nodeAnimation.scales, scaleError);
+            } else {
+                // Preserve legacy keyframe mode's exact constant compaction.
+                auto exactError = [](const auto& a, const auto&, const auto& v, double) {
+                    return a == v ? 0.0 : 2.0;
+                };
+                auto compact = [&](auto& channel) {
+                    if (std::all_of(channel.values.begin(),
+                                    channel.values.end(),
+                                    [&](const auto& v) { return v == channel.values.front(); }))
+                        reduce(channel, exactError);
+                };
+                compact(nodeAnimation.translations);
+                compact(nodeAnimation.rotations);
+                compact(nodeAnimation.scales);
+            }
             TF_DEBUG_MSG(FILE_FORMAT_FBX,
                          "Sampled node %s: %zu transform samples\n",
                          fbxNode->GetName(),

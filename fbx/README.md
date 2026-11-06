@@ -173,7 +173,7 @@ Note that PBR materials are not supported on export, only Phong
 
     `adaptive` starts with original keys and source-frame samples, preserves held
     transitions with one-sided samples and refines intervals against SDK evaluation.
-    It retains the existing refinement tolerances and approximates motion using
+    It reduces translation, rotation and scale independently and approximates motion using
     ordinary USD time samples; it does not author source curve tangents or splines.
 
     Both modes retain source-frame time codes and the same transform decomposition.
@@ -192,6 +192,33 @@ Note that PBR materials are not supported on export, only Phong
     the same FBX. `animationMode` can also be authored as prim metadata for a dynamic
     FBX payload; changing it recomposes the payload. Once exported to USD, changing
     this option does not alter the exported samples: reopen the FBX with the desired mode.
+
+Adaptive mode accepts these finite file-format arguments (also available
+as string metadata on dynamic payloads):
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `animationPositionTolerance` | `0.0001` | Translation error in meters, accounting for parent scale and float precision |
+| `animationRotationTolerance` | `0.01` | Local rotation error in degrees; must be less than 180 |
+| `animationScaleTolerance` | `0.00001` | Relative local scale error, with a unit floor |
+| `animationMaxSampleRate` | `0` | Optional maximum frequency of additional adaptive subdivisions, in Hz; zero disables the rate cap |
+
+Tolerances must be positive; the rate must be non-negative. Refinement and channel
+reduction each use half the error budget. Translation,
+rotation and scale are reduced independently; nearly constant channels collapse
+to their evaluated value and retain clip endpoints. Source keys and one-sided
+samples around held transitions are not discarded by the frequency limit; the
+subsequent reduction only removes samples within its error budget. The importer
+warns when a frequency or recursion limit prevents meeting the refinement tolerance. These
+are sampled error controls, not a bound on accumulated world-space error through
+a hierarchy. Translation uses a conservative bound on parent transform stretch
+over evaluated times; this avoids oversampling rigs scaled down relative to the
+scene's units. Rotation and scale tolerances are local. Keyframe mode retains
+its existing behavior.
+
+Rotation checks cover both USD's orientation-matrix evaluation and unit-quaternion
+slerp used by direct-channel consumers. USD's close-angle interpolation can yield
+non-unit quaternions; these paths otherwise differ near zero rotation.
 
 * `fbxAnimationStacks`: Import multiple animation stacks. Default is `false`
 

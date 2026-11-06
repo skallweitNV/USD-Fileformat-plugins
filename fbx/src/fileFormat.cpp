@@ -15,6 +15,8 @@ governing permissions and limitations under the License.
 #include "fbx.h"
 #include "fbxExport.h"
 #include "fbxImport.h"
+#include <cmath>
+#include <exception>
 #include <mutex>
 
 #include <fileformatutils/common.h>
@@ -30,6 +32,14 @@ PXR_NAMESPACE_OPEN_SCOPE
 static std::mutex mutex;
 const TfToken UsdFbxFileFormat::animationStacksToken("fbxAnimationStacks", TfToken::Immortal);
 const TfToken UsdFbxFileFormat::animationModeToken("animationMode", TfToken::Immortal);
+const TfToken UsdFbxFileFormat::animationPositionToleranceToken("animationPositionTolerance",
+                                                                TfToken::Immortal);
+const TfToken UsdFbxFileFormat::animationRotationToleranceToken("animationRotationTolerance",
+                                                                TfToken::Immortal);
+const TfToken UsdFbxFileFormat::animationScaleToleranceToken("animationScaleTolerance",
+                                                             TfToken::Immortal);
+const TfToken UsdFbxFileFormat::animationMaxSampleRateToken("animationMaxSampleRate",
+                                                            TfToken::Immortal);
 const TfToken UsdFbxFileFormat::assetsPathToken("fbxAssetsPath", TfToken::Immortal);
 const TfToken UsdFbxFileFormat::importLightsToken("importLights", TfToken::Immortal);
 const TfToken UsdFbxFileFormat::originalColorSpaceToken("fbxOriginalColorSpace", TfToken::Immortal);
@@ -71,6 +81,14 @@ UsdFbxFileFormat::InitData(const FileFormatArguments& args) const
 
     argReadBool(args, animationStacksToken.GetString(), pd->animationStacks, DEBUG_TAG);
     argReadString(args, animationModeToken.GetString(), pd->animationMode, DEBUG_TAG);
+    argReadString(
+      args, animationPositionToleranceToken.GetString(), pd->animationPositionTolerance, DEBUG_TAG);
+    argReadString(
+      args, animationRotationToleranceToken.GetString(), pd->animationRotationTolerance, DEBUG_TAG);
+    argReadString(
+      args, animationScaleToleranceToken.GetString(), pd->animationScaleTolerance, DEBUG_TAG);
+    argReadString(
+      args, animationMaxSampleRateToken.GetString(), pd->animationMaxSampleRate, DEBUG_TAG);
     argReadBool(args, importLightsToken.GetString(), pd->importLights, DEBUG_TAG);
     argReadBool(args, phongToken.GetString(), pd->phong, DEBUG_TAG);
     argReadBool(args, triangulateMeshesToken.GetString(), pd->triangulateMeshes, DEBUG_TAG);
@@ -85,6 +103,10 @@ UsdFbxFileFormat::ComposeFieldsForFileFormatArguments(const std::string& assetPa
 {
     argComposeBool(context, args, animationStacksToken, DEBUG_TAG);
     argComposeString(context, args, animationModeToken, DEBUG_TAG);
+    argComposeString(context, args, animationPositionToleranceToken, DEBUG_TAG);
+    argComposeString(context, args, animationRotationToleranceToken, DEBUG_TAG);
+    argComposeString(context, args, animationScaleToleranceToken, DEBUG_TAG);
+    argComposeString(context, args, animationMaxSampleRateToken, DEBUG_TAG);
     argComposeString(context, args, assetsPathToken, DEBUG_TAG);
     argComposeBool(context, args, importLightsToken, DEBUG_TAG);
     argComposeBool(context, args, phongToken, DEBUG_TAG);
@@ -124,6 +146,39 @@ UsdFbxFileFormat::Read(SdfLayer* layer, const std::string& resolvedPath, bool me
     } else if (data->animationMode != "adaptive") {
         TF_RUNTIME_ERROR("Invalid animationMode '%s'; expected 'keyframes' or 'adaptive'.",
                          data->animationMode.c_str());
+        return false;
+    }
+    auto read_number =
+      [](const std::string& text, const char* name, double& value, bool allowZero = false) {
+          try {
+              size_t end = 0;
+              value = std::stod(text, &end);
+              if (end == text.size() && std::isfinite(value) &&
+                  (value > 0 || (allowZero && value == 0)))
+                  return true;
+          } catch (const std::exception&) {}
+          TF_RUNTIME_ERROR("Invalid %s '%s'; expected a finite %s number.",
+                           name,
+                           text.c_str(),
+                           allowZero ? "non-negative" : "positive");
+          return false;
+      };
+    if (!read_number(data->animationPositionTolerance,
+                     "animationPositionTolerance",
+                     options.animationPositionTolerance) ||
+        !read_number(data->animationRotationTolerance,
+                     "animationRotationTolerance",
+                     options.animationRotationTolerance) ||
+        !read_number(data->animationScaleTolerance,
+                     "animationScaleTolerance",
+                     options.animationScaleTolerance) ||
+        !read_number(data->animationMaxSampleRate,
+                     "animationMaxSampleRate",
+                     options.animationMaxSampleRate,
+                     true))
+        return false;
+    if (options.animationRotationTolerance >= 180) {
+        TF_RUNTIME_ERROR("animationRotationTolerance must be less than 180 degrees.");
         return false;
     }
     options.importGeometry = true;

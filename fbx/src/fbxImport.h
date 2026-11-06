@@ -32,6 +32,11 @@ struct ImportFbxOptions
     bool importAnimationStacks = false;
     bool triangulateMeshes = true;
     FBXAnimationMode animationMode = FBXAnimationMode::Adaptive;
+    // Refinement and reduction each use half of these error budgets.
+    double animationPositionTolerance = 0.0001; // Meters, accounting for parent scale.
+    double animationRotationTolerance = 0.01;   // Degrees.
+    double animationScaleTolerance = 0.00001;   // Relative, with a unit floor.
+    double animationMaxSampleRate = 0.0; // Extra subdivisions only; zero disables the rate cap.
     PXR_NS::TfToken originalColorSpace;
 };
 

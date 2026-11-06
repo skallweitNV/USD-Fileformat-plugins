@@ -49,6 +49,10 @@ class FbxData : public FileFormatDataBase
 public:
     bool animationStacks = false;
     std::string animationMode = "adaptive";
+    std::string animationPositionTolerance = "0.0001";
+    std::string animationRotationTolerance = "0.01";
+    std::string animationScaleTolerance = "0.00001";
+    std::string animationMaxSampleRate = "0";
     bool importLights = true;
     bool phong = false;
     bool triangulateMeshes = true;
@@ -103,6 +107,10 @@ public:
 protected:
     static const TfToken animationStacksToken;
     static const TfToken animationModeToken;
+    static const TfToken animationPositionToleranceToken;
+    static const TfToken animationRotationToleranceToken;
+    static const TfToken animationScaleToleranceToken;
+    static const TfToken animationMaxSampleRateToken;
     static const TfToken assetsPathToken;
     static const TfToken importLightsToken;
     static const TfToken originalColorSpaceToken;

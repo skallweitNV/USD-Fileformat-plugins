@@ -27,6 +27,30 @@
                         "documentation": "Node transform sampling: keyframes or adaptive (default). Skeletal sampling is unchanged.",
                         "type": "string"
                     },
+                    "animationPositionTolerance": {
+                        "appliesTo": [ "prims" ],
+                        "displayGroup": "Core",
+                        "documentation": "Adaptive translation tolerance in meters, accounting for parent scale (default 0.0001).",
+                        "type": "string"
+                    },
+                    "animationRotationTolerance": {
+                        "appliesTo": [ "prims" ],
+                        "displayGroup": "Core",
+                        "documentation": "Adaptive local rotation tolerance in degrees (default 0.01, less than 180).",
+                        "type": "string"
+                    },
+                    "animationScaleTolerance": {
+                        "appliesTo": [ "prims" ],
+                        "displayGroup": "Core",
+                        "documentation": "Adaptive relative local scale tolerance with a unit floor (default 0.00001).",
+                        "type": "string"
+                    },
+                    "animationMaxSampleRate": {
+                        "appliesTo": [ "prims" ],
+                        "displayGroup": "Core",
+                        "documentation": "Maximum frequency of extra adaptive subdivisions in Hz (default 0 disables the rate cap). Authored keys survive sampling; error-based channel reduction follows. Limits that prevent meeting tolerance issue warnings.",
+                        "type": "string"
+                    },
                     "importLights": {
                         "appliesTo": [ "prims" ],
                         "displayGroup": "Core",
